@@ -32,24 +32,48 @@ vendor kernel, not guessed):
 - `sweet_hid_touch(finger,down,x,y)` (SweetHID) normalizes x/1080, y/2400, so the
   driver scales Novatek 1600x2560 down to 1080x2400 before calling it.
 
-**Driver strategy (first version, written blind):** it does NOT reset the IC or
-download firmware — it assumes Android's firmware stays resident across the
-`fastboot boot` (touch rail stays powered, ABL doesn't pulse reset). On start
-(boot-arg `nabutouchdelay`, default 45 s) it brings up the SE19 clock/GPIO/SPI,
-reads the FWINFO block (EVENT_BUF+0x78) to confirm SPI comms + firmware liveness
-(valid when fw_ver + ~fw_ver == 0xff), then polls the event buffer every 10 ms.
-Expect iteration: the first boot's `SWEET NABU-TOUCH:` log lines tell us whether
-(a) SE19 is SPI-proto, (b) FWINFO reads back sane (fw live), (c) events parse.
-Likely follow-ups if dead: add the reset-GPIO pulse + Novatek bootloader/FW
-download (big), or tune `nabutouchdiv`. Coordinate calibration comes after reports.
+**KEY FINDING (first boot of 0083, 2026-10-19):** the driver ran and read SE19:
+`se fw=0x303 proto=3 (1=SPI)` — ABL leaves SE19 running the **GENI I2C**
+firmware, not SPI. A GENI serial engine is a programmable state machine; its
+protocol is set by firmware loaded into its config RAM. 0xc88000 = qup19, and
+the nabu touch is 100% SPI (MiCode driver = `spi_register_driver`, compatible
+`novatek,NVT-ts-spi`, `spi-max-frequency` 9.6 MHz; the SE can be i2c19 OR spi19
+at the same address). So we must load the GENI **SPI** SE firmware into SE19
+before any SPI, exactly as the Android kernel does at probe. (This is the GENI
+SE firmware — the SoC serial engine — NOT the NT36523 controller firmware; the
+192 KB `novatek_nt36523_fw.bin` in ZenOS/boards/firmware is the latter, needed
+only later if the chip itself needs a host FW download.)
+
+**Driver strategy (0083, now with firmware load):** on start (boot-arg
+`nabutouchdelay`, default 45 s) it votes the wrap2 SE clock, and if SE19's
+proto != SPI it **loads the GENI SPI SE firmware** into the SE config RAM
+(sequence verbatim from the mainline "load QUP SE Firmware" patch: wrapper CGC,
+PROG_RAM clock-gate toggle around writing CFG_RAMN 0x1010, CFG_REG0 0x100,
+FW_REVISION 0x1000/0x1004, FORCE_DEFAULT, SER_CLK_SEL, DMA_IF_EN, clear
+FIFO_IF_DISABLE). The SPI SEFW image is lifted from the device's own **qupfw
+partition** (`/dev/block/by-name/qupfw_a` = sde18, 128 KB ELF with SEFW
+segments; magic 'SEFW'=0x57464553). It contains images for all protocols and
+TWO QUPV3 core versions (0x10020000 fw_items=475, 0x10030000 fw_items=474);
+both SPI images are embedded in the driver and selected at runtime by
+QUP_HW_VER (wrapper geniqup@cc0000 + 0x4). After load it re-reads proto (want
+1), configures SPI (word_len 4, MSB packing, mode 0, SER_M_CLK_CFG div 8 =
+2.4 MHz), muxes gpio55-58, reads FWINFO (comms check), then polls events.
+Keep the pulled `qupfw_a.img`/`qupfw_b.img` and `novatek_nt36523_fw.bin`
+OUT of git (device artifacts, per AGENTS.md).
+
+Risk if it stalls: SM8150 may XPU-protect the SE config RAM (direct writes
+fault) — then the load must go via a TZ SCM call instead. First boot's log
+tells us: look for `after load fw=... proto=1`. If proto stays 3, it's XPU/TZ.
 
 Locally verified: driver compiles clean (clang -fsyntax-only, 0 warnings),
-packing constants reproduced by script, and `git apply --check` of 0083 passes.
+packing + firmware extraction reproduced by script, `git apply --check` of 0083
+passes against the real patched xnu tree (from `xnu-buildtree/buildtree.tgz`).
 
-**Next concrete action:** push patch 0083, run the CI kernel build, rebuild the
-shim payload, `fastboot boot`, and read the `SWEET NABU-TOUCH:` lines from the
-persistent log (it reaches GUI so the on-screen/log path is available). Add
-`nabutouch=1 sweettouch=0` to the nabu cmdline; keep `nabutouchdelay=45`.
+**Next concrete action:** push 0083 (CI auto-builds on `xnu/patches/**`),
+download the kernel, VERIFY `strings kernel.development.sweet | grep -c NABU-TOUCH`
+> 0, rebuild the shim payload with `nabutouch=1 sweettouch=0 nabutouchdelay=45`,
+`fastboot boot`, read the `SWEET NABU-TOUCH:` lines. The decisive new line is
+`after load fw=0x1.. proto=1` (SPI firmware took) followed by `fwinfo ...`.
 
 ### >>> UPDATE 2026-10-19 (nabu = Xiaomi Pad 5 bring-up, read first) <<<
 

@@ -23,7 +23,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,570 @@
+@@ -0,0 +1,837 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
@@ -32,23 +32,29 @@
 + * Enabled by boot-arg nabutouch=1 (default off); on nabu also pass
 + * sweettouch=0 so the SE7 I2C probe does not run.
 + *
-+ * Written blind for CI bring-up. It assumes the touch rail stays powered and
-+ * the controller keeps the firmware Android loaded resident across the
-+ * `fastboot boot` handoff (ABL does not pulse the touch reset): we do NOT
-+ * reset the IC and do NOT download firmware here. First we confirm SPI comms
-+ * by reading the firmware-info block (EVENT_BUF + 0x78); then we poll the
-+ * event buffer and feed sweet_hid_touch().
++ * Written blind for CI bring-up. ABL leaves SE19 running the *I2C* GENI
++ * firmware (proto=3), so before any SPI we load the GENI *SPI* serial-engine
++ * firmware into the SE's config RAM, exactly as the downstream kernel does
++ * (sequence from the mainline "load QUP SE Firmware" patch; the SPI SEFW
++ * image is lifted from the device's own qupfw partition, two QUPV3 core
++ * versions, selected at runtime by QUP_HW_VER). Only then does proto become
++ * SPI and the FIFO engine work.
 + *
-+ * Only writes issued: the GENI SE config, the QUPv3 wrap2 clock vote/RCG, the
-+ * gpio55-58 qup19 mux, and the Novatek page-select writes. No PMIC / RPMh.
++ * It does NOT reset the NT36523 or download its controller firmware; it
++ * assumes that stays resident across the fastboot handoff. First it confirms
++ * SPI comms (FWINFO at EVENT_BUF+0x78), then polls the event buffer.
 + *
-+ * Register facts (Linux v6.6):
-+ *   gcc-sm8150.c:   wrap2_s2 RCG cmd_rcgr 0x1e3a8; branch vote 0x52014
-+ *                   (s2 clk BIT6, wrap_2 m-ahb BIT2, s-ahb BIT1).
-+ *   pinctrl-sm8150: gpio55-58 SOUTH tile (base 0x03d00000), ctl = pin*0x1000,
-+ *                   func qup19 = mux 2; mux_bit 2, pull_bit 0, drv_bit 6, oe 9.
-+ *   spi-geni-qcom.c + qcom-geni-se.c: SPI register map, FIFO packing, M_CMD.
-+ *   MiCode nabu nt36523: EVENT_BUF_ADDR 0x2FE00, SPI R/W bit7, 1 dummy byte.
++ * Register facts (Linux v6.6 + MiCode nabu + the SE-FW-load patch):
++ *   gcc-sm8150.c:   wrap2_s2 RCG 0x1e3a8; branch vote 0x52014 (s2 BIT6,
++ *                   m-ahb BIT2, s-ahb BIT1).
++ *   pinctrl-sm8150: gpio55-58 SOUTH tile (0x03d00000), ctl pin*0x1000, qup19
++ *                   = mux 2; mux_bit 2, pull_bit 0, drv_bit 6, oe 9.
++ *   geniqup@cc0000: wrapper-2; QUP_HW_VER at +0x4.
++ *   SE FW load:     CGC 0x28, CLK_CTRL 0x2000, CFG_REG0 0x100, CFG_RAMN
++ *                   0x1010, FW_REVISION 0x1000/0x1004, INIT_CFG 0x0/0x4,
++ *                   DMA_IF_EN 0x2004, FIFO_IF_DISABLE 0x2008, PROG_RAM
++ *                   SCLK/HCLK off BIT9/BIT8, DMA_GENERAL_CFG 0xe30.
++ *   MiCode nt36523: EVENT_BUF_ADDR 0x2FE00, read=clear bit7, 1 dummy byte.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -76,17 +82,25 @@
 +#define NT_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
 +#define NT_GPIO_IO(n)    (NT_GPIO_CFG(n) + 4u)
 +#define NT_SE_PA         0x00c88000u
++/* geniqup@cc0000 wrapper (QUP_HW_VER + common CGC used by fw load). */
++#define NT_WRAP_PA       0x00cc0000u
++#define NT_QUP_HW_VER    0x004u
++#define NT_WRAP_COMMON_CFG   0x120u
++#define NT_WRAP_SE_AHB_M_CFG 0x118u
++#define NT_WRAP_COMMON_CGC   0x21cu
 +#define NT_MAX           10u
 +
 +/* GENI common (geni-se.h). */
 +#define G_SER_M_CLK_CFG  0x048u
-+#define G_FW_REV         0x068u
++#define G_FW_REV         0x068u            /* RO: current loaded fw/proto */
 +#define G_STATUS         0x040u
 +#define G_FORCE_DEFAULT  0x020u
 +#define G_OUTPUT_CTRL    0x024u
 +#define G_CGC_CTRL       0x028u
++#define G_INIT_CFG_REV   0x000u
++#define G_S_INIT_CFG_REV 0x004u
++#define G_CFG_REG0       0x100u
 +#define G_CLK_SEL        0x07cu
-+#define G_SE_CLK_CTRL    0xe30u
 +#define G_BYTE_GRAN      0x254u
 +#define G_DMA_MODE_EN    0x258u
 +#define G_TX_PACK0       0x260u
@@ -105,10 +119,30 @@
 +#define G_RX_FIFO_STATUS 0x804u
 +#define G_TX_WATERMARK   0x80cu
 +#define G_RX_RFR_WM      0x814u
-+#define G_HW_PARAM_0     0xe24u           /* TX FIFO width/depth */
-+#define G_HW_PARAM_1     0xe28u           /* RX FIFO width/depth */
++#define G_FW_REVISION    0x1000u           /* WR: protocol + fw version */
++#define G_S_FW_REVISION  0x1004u
++#define G_CFG_RAMN       0x1010u           /* firmware RAM window */
++#define G_CLK_CTRL       0x2000u
++#define G_DMA_IF_EN      0x2004u
++#define G_FIFO_IF_DIS    0x2008u
++#define G_HW_PARAM_0     0xe24u
++#define G_HW_PARAM_1     0xe28u
 +#define G_GSI_EVENT_EN   0xe18u
 +#define G_IRQ_EN         0xe1cu
++#define G_DMA_GEN_CFG    0xe30u            /* SE_DMA_GENERAL_CFG */
++/* fw-load bits. */
++#define PROG_RAM_HCLK_OFF (1u << 8)
++#define PROG_RAM_SCLK_OFF (1u << 9)
++#define PROG_RAM_OFF      (PROG_RAM_HCLK_OFF | PROG_RAM_SCLK_OFF)
++#define DEFAULT_CGC_EN    0x7fu
++#define DEFAULT_IO_OUT    0x7fu
++#define SER_CLK_SEL       (1u << 0)
++#define DMA_IF_EN_BIT     (1u << 0)
++#define FIFO_IF_DISABLE   (1u << 0)
++#define DMA_CGC_ON        0x0fu            /* rx/tx/ahb-slv/ahb-sec clk cgc */
++#define FAST_SWITCH_HIGH  (1u << 0)
++#define AHB_M_CLK_CGC_ON  (1u << 0)
++#define COMMON_SLV_CGC_ON (1u << 0)
 +/* SPI block (spi-geni-qcom.c). */
 +#define SPI_CPHA         0x224u
 +#define SPI_CPOL         0x230u
@@ -136,23 +170,188 @@
 +#define M_ERRORS         ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5))
 +/* RX_FIFO_STATUS. */
 +#define RX_WC_MSK        0x1ffffffu
-+#define RX_LAST          (1u << 31)
-+#define RX_LAST_VALID    (7u << 28)
 +/* Novatek NT36523. */
 +#define NVT_EVENT_BUF    0x2fe00u
-+#define NVT_FWINFO_OFF   0x78u            /* EVENT_MAP_FWINFO */
-+#define NVT_RD(a)        ((uint8_t)((a) & 0x7fu))   /* read: clear bit7 */
-+#define NVT_WR(a)        ((uint8_t)((a) | 0x80u))   /* write: set bit7 */
++#define NVT_FWINFO_OFF   0x78u
++#define NVT_RD(a)        ((uint8_t)((a) & 0x7fu))
++#define NVT_WR(a)        ((uint8_t)((a) | 0x80u))
 +#define NVT_DUMMY        1u
 +/* Logical maxima sweet_hid_touch() normalizes against (SweetHID /1080 /2400). */
 +#define NT_HID_X         1080
 +#define NT_HID_Y         2400
 +
++/* Auto-extracted from nabu qupfw (qupfw_a). GENI SPI SEFW images.
++ * Do NOT edit by hand. Two QUPV3 core versions; driver picks by
++ * QUP_HW_VER (wrapper+0x4). Fields per struct se_fw_hdr (SEFW). */
++
++/* core 0x10020000 proto SPI fwver=12801 cfgver=7 fw_items=475 cfg_items=66 */
++static const uint32_t nvt_spi_fw_10020000[475] = {
++  0x000007fe,0x00000000,0x00000000,0x00000000,0x0011a800,0x00334020,0x003c4800,0x0060c010,
++  0x00666800,0x0082c030,0x008e8800,0x00334060,0x00914800,0x0099c010,0x00b8e800,0x00e7c030,
++  0x0011e800,0x00324010,0x00898800,0x00004008,0x008a0800,0x00004008,0x008b8800,0x00004008,
++  0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x00610b6b,0x007f1140,0x007f3881,0x00ff7aab,0x007f6f5f,
++  0x007f7807,0x007f7953,0x007f7850,0x009f309b,0x009f1058,0x00864861,0x007f3a04,0x009f6890,
++  0x007f6f6f,0x009f4869,0x007f781f,0x009f7883,0x007f7848,0x007f780b,0x009f7877,0x009f606f,
++  0x00643a04,0x013f2872,0x00cc6075,0x0067b828,0x0067ba00,0x0087e87b,0x0125b06e,0x009f789b,
++  0x00c62880,0x0067b828,0x0067b900,0x0127e087,0x0085b080,0x009f789b,0x009f288c,0x00060000,
++  0x0067b828,0x0067ba00,0x0087e895,0x00c5a891,0x009f308c,0x009b38bb,0x00630b0b,0x007f4401,
++  0x007f3905,0x009f60a3,0x008328b8,0x008328aa,0x007f1e00,0x008328b0,0x007f3903,0x009f60af,
++  0x007f1c20,0x009b30b6,0x007f1c40,0x001f4000,0x008478a7,0x007f4401,0x007f1c20,0x007f3a04,
++  0x007f2008,0x009f68c3,0x009f08c4,0x009f78f9,0x007f0bfb,0x009f1183,0x009f50e9,0x007f4401,
++  0x007f6001,0x007f3905,0x009f60d5,0x00720b4b,0x007f1000,0x009a18e5,0x009b08b7,0x007f5c01,
++  0x007f1c40,0x009f78b7,0x007f1e00,0x009f78dd,0x007ff950,0x009fd0ee,0x0087d0ed,0x008578cf,
++  0x00010000,0x009a017d,0x009a0979,0x007f3905,0x00635c05,0x007f3882,0x009f4903,0x007f3a04,
++  0x009f6922,0x007f7808,0x007f7956,0x007f6eef,0x007f3820,0x007f2c01,0x007f2c05,0x007f2c05,
++  0x007f0400,0x007f4001,0x007f7850,0x007f1c02,0x009f6119,0x009f491f,0x009f793f,0x007f7848,
++  0x009f7933,0x007f7952,0x007f6ebf,0x009f6127,0x009f7951,0x009f612b,0x00643a04,0x013f292e,
++  0x008b6131,0x00683828,0x0068ba00,0x0088e937,0x0128d92b,0x009f7959,0x009f293c,0x00683828,
++  0x0068b900,0x0128e143,0x0088d93d,0x009f7959,0x00882951,0x007f4001,0x009f294c,0x007f4401,
++  0x00683820,0x0088d153,0x00885949,0x00887959,0x007f0b0b,0x007f4401,0x007f3905,0x009f615f,
++  0x00832976,0x00832966,0x007f1e00,0x0083296c,0x007f3903,0x009f616b,0x009b3170,0x007f1c20,
++  0x007f2009,0x007f1c40,0x001f4000,0x00847963,0x007f1e00,0x009f78f7,0x007f3903,0x009f617f,
++  0x009f78f5,0x00dfd183,0x009b1189,0x007f5c01,0x007f6001,0x007f3905,0x007f4401,0x009f618f,
++  0x009a1995,0x0092796d,0x00721e00,0x009f796d,0x00616e5f,0x007f0b6b,0x007f1140,0x007f5c05,
++  0x007f3881,0x00ff7aab,0x007f7953,0x007f7809,0x007f7850,0x009f61ab,0x008649b3,0x007f3a04,
++  0x009f69e2,0x007f6e6f,0x009f49bb,0x007f781f,0x009f79d5,0x007f7848,0x007f780b,0x009f79c9,
++  0x009f61c1,0x00643a04,0x013f29c4,0x00cc61c7,0x0069b828,0x0069ba00,0x0089e9cd,0x0128b1c0,
++  0x009f79ed,0x00c629d2,0x0069b828,0x0069b900,0x0129e1d9,0x0088b1d2,0x009f79ed,0x009f29de,
++  0x00060000,0x0069b828,0x0069ba00,0x0089e9e7,0x00c8a9e3,0x009f31de,0x00630b0b,0x007f4401,
++  0x007f3905,0x009f61f3,0x00832a08,0x001f0000,0x008329fc,0x007f1e00,0x00832a02,0x007f3903,
++  0x009f6201,0x007f1c20,0x007f1c40,0x001f4000,0x008479f9,0x009f521f,0x007f4401,0x007f6001,
++  0x007f3905,0x009f6213,0x00725c08,0x009a1a1a,0x007f1e00,0x007f1c40,0x001f4000,0x007ff950,
++  0x009fd224,0x0089d223,0x00887a0d,0x000b4000,0x009f022c,0x007f6001,0x00044000,0x007f3820,
++  0x001f0800,0x000f0000,0x008fd233,0x000f2800,0x001f4000,0x000b0000,0x000d0000,0x002a30a0,
++  0x00641c20,0x001f4000,0x00010000,0x00655c05,0x0065081b,0x00050800,0x00854a60,0x00854a63,
++  0x00854a64,0x00854a67,0x009f4a66,0x009f4a67,0x009f4a66,0x009f4a67,0x00641c40,0x001f4000,
++  0x00050000,0x00050000,0x00050000,0x00792401,0x009f7a5d,0x009f626b,0x007f6d7f,0x007f096b,
++  0x007f78c4,0x007f7807,0x007f3a04,0x009f6a7e,0x007f2001,0x009f7a7f,0x00c52a89,0x009f00cf,
++  0x009f127e,0x007f3a04,0x009f6a85,0x00060000,0x0067b900,0x00671c82,0x0087628d,0x0087527d,
++  0x00050000,0x009f00cf,0x001f1000,0x009f4aa1,0x007f3a04,0x009f6a9b,0x00053000,0x00857a93,
++  0x007f0b6b,0x007f3820,0x007f78cc,0x009b389b,0x009f7abd,0x009a02b0,0x007f3903,0x009f62af,
++  0x009a0ab4,0x007f1e00,0x007f3905,0x009b3abb,0x009b0abc,0x009a2a6b,0x007f2c01,0x007f2c05,
++  0x007f2c05,0x007f0400,0x007f4001,0x009f62c7,0x001f0001,0x007f0b0b,0x007f4401,0x007f3905,
++  0x009f62d1,0x009a12d7,0x00040000,0x009a1ada,0x007f1e00,0x009a22e0,0x007f3903,0x009f62df,
++  0x001f0001,0x00610b6b,0x007f1140,0x007f5c05,0x007f3882,0x00ff7aab,0x007f4401,0x007f7953,
++  0x007f6e5f,0x007f7809,0x007f7850,0x009f62f7,0x00864aff,0x007f3a04,0x009f6b66,0x007f6e6f,
++  0x009f4b07,0x007f781f,0x009f7b3d,0x007f7848,0x007f780b,0x009f7b17,0x009f630d,0x00643a04,
++  0x009f039f,0x013f2b10,0x00cc6315,0x00693820,0x0089d319,0x00895b2c,0x0128330c,0x007f6eef,
++  0x007f2008,0x007f7808,0x007f1c02,0x007f7956,0x007f4001,0x0083792b,0x00686f6f,0x007f780b,
++  0x007f2004,0x007f4001,0x013f306e,0x009f7b85,0x009f039f,0x00c62b38,0x00693820,0x0129d33f,
++  0x00895b54,0x0088333a,0x007f6eef,0x007f2008,0x007f7808,0x007f1c02,0x007f7956,0x007f4001,
++  0x0083293f,0x009f793d,0x00686f6f,0x007f781f,0x007f2004,0x007f4001,0x009f3080,0x009f7b85,
++  0x009f039f,0x009f2b60,0x00060000,0x00693820,0x0089d369,0x00895b78,0x00c82b67,0x009f3360,
++  0x007f7952,0x00636ebf,0x009f2951,0x009f794b,0x00686f5f,0x007f7807,0x007f2004,0x007f4001,
++  0x009f288f,0x009f308c,0x007f0b0b,0x007f3905,0x009f6389,0x009a138f,0x00040000,0x009a1b92,
++  0x007f1e00,0x009a2398,0x007f3903,0x009f6397,0x007f1c20,0x007f1c40,0x001f4000,0x009f53a4,
++  0x00989183,0x0098b0e9,0x007f4401,0x007f6001,0x007f3905,0x009f63ab,0x00725c08,0x009a1bb2,
++  0x007f1e00,0x007f1c40,0x001f4000,
++};
++static const uint8_t nvt_spi_cfgidx_10020000[66] = {
++  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,
++};
++static const uint32_t nvt_spi_cfgval_10020000[66] = {
++  0x00000000,0x00000400,0x00000000,0x00000000,0x00240e78,0x00011088,0x00240007,0x00000000,
++  0x00000000,0x0001000a,0x00000300,0x00000000,0x00000000,0x00000000,0x00154400,0x001483a0,
++  0x00aa8128,0x00641002,0x00000000,0x00000201,0x0001fe05,0x0002c2e7,0x0a435c00,0x0010011a,
++  0x08800000,0x00000000,0x100caff7,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x000018e4,0x00000000,0x00000003,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x0007f807,0x000ffefe,0x00000000,0x00000000,0x00000000,
++  0x00000000,0x00300000,0x00000000,0x00000009,0x0007f807,0x000ffefe,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x0000013f,
++  0x00000000,0x00000000,
++};
++
++/* core 0x10030000 proto SPI fwver=12800 cfgver=7 fw_items=474 cfg_items=66 */
++static const uint32_t nvt_spi_fw_10030000[474] = {
++  0x000007fe,0x00000000,0x00000000,0x00000000,0x0011a800,0x00334020,0x003c4800,0x0060c010,
++  0x00666800,0x0082c030,0x008e8800,0x00334060,0x00914800,0x0099c010,0x009ae800,0x00c9c030,
++  0x0011e800,0x00324010,0x00898800,0x00004008,0x008a0800,0x00004008,0x008b8800,0x00004008,
++  0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x00610b6b,0x007f1140,0x007f3881,0x00ff7b3f,0x007f6f5f,
++  0x007f7807,0x007f7953,0x007f7850,0x009f309b,0x009f1058,0x00864861,0x007f3a04,0x009f6890,
++  0x007f6f6f,0x009f4869,0x007f781f,0x009f7883,0x007f7848,0x007f780b,0x009f7877,0x009f606f,
++  0x00643a04,0x013f2872,0x00cc6075,0x0067b828,0x0067ba00,0x0087e87b,0x0125b06e,0x009f789b,
++  0x00c62880,0x0067b828,0x0067b900,0x0127e087,0x0085b080,0x009f789b,0x009f288c,0x00060000,
++  0x0067b828,0x0067ba00,0x0087e895,0x00c5a891,0x009f308c,0x009b38bb,0x00630b0b,0x007f4401,
++  0x007f3905,0x009f60a3,0x008328b8,0x008328aa,0x007f1e00,0x008328b0,0x007f3903,0x009f60af,
++  0x007f1c20,0x009b30b6,0x007f1c40,0x001f4000,0x008478a7,0x007f4401,0x007f1c20,0x007f3a04,
++  0x007f2008,0x009f68c3,0x009f08c4,0x009f78f9,0x007f0bfb,0x009f1183,0x009f50e9,0x007f4401,
++  0x007f6001,0x007f3905,0x009f60d5,0x00720b4b,0x007f1000,0x009a18e5,0x009b08b7,0x007f5c01,
++  0x007f1c40,0x009f78b7,0x007f1e00,0x009f78dd,0x007ff950,0x009fd0ee,0x0087d0ed,0x008578cf,
++  0x00010000,0x009a017d,0x009a0979,0x007f3905,0x00635c05,0x007f3882,0x009f4903,0x007f3a04,
++  0x009f6922,0x007f7808,0x007f7956,0x007f6eef,0x007f3820,0x007f2c01,0x007f2c05,0x007f2c05,
++  0x007f0400,0x007f4001,0x007f7850,0x007f1c02,0x009f6119,0x009f491f,0x009f793f,0x007f7848,
++  0x009f7933,0x007f7952,0x007f6ebf,0x009f6127,0x009f7951,0x009f612b,0x00643a04,0x013f292e,
++  0x008b6131,0x00683828,0x0068ba00,0x0088e937,0x0128d92b,0x009f7959,0x009f293c,0x00683828,
++  0x0068b900,0x0128e143,0x0088d93d,0x009f7959,0x00882951,0x007f4001,0x009f294c,0x007f4401,
++  0x00683820,0x0088d153,0x00885949,0x00887959,0x007f0b0b,0x007f4401,0x007f3905,0x009f615f,
++  0x00832976,0x00832966,0x007f1e00,0x0083296c,0x007f3903,0x009f616b,0x009b3170,0x007f1c20,
++  0x007f2009,0x007f1c40,0x001f4000,0x00847963,0x007f1e00,0x009f78f7,0x007f3903,0x009f617f,
++  0x009f78f5,0x00dfd183,0x009b1189,0x007f5c01,0x007f6001,0x007f3905,0x007f4401,0x009f618f,
++  0x009a1995,0x0092796d,0x00721e00,0x009f796d,0x00616e5f,0x007f0b6b,0x007f1140,0x007f5c05,
++  0x007f3881,0x00ff7b3f,0x007f7953,0x007f7809,0x007f7850,0x009f61ab,0x008649b3,0x007f3a04,
++  0x009f69e2,0x007f6e6f,0x009f49bb,0x007f781f,0x009f79d5,0x007f7848,0x007f780b,0x009f79c9,
++  0x009f61c1,0x00643a04,0x013f29c4,0x00cc61c7,0x0069b828,0x0069ba00,0x0089e9cd,0x0128b1c0,
++  0x009f79ed,0x00c629d2,0x0069b828,0x0069b900,0x0129e1d9,0x0088b1d2,0x009f79ed,0x009f29de,
++  0x00060000,0x0069b828,0x0069ba00,0x0089e9e7,0x00c8a9e3,0x009f31de,0x00630b0b,0x007f4401,
++  0x007f3905,0x009f61f3,0x00832a08,0x001f0000,0x008329fc,0x007f1e00,0x00832a02,0x007f3903,
++  0x009f6201,0x007f1c20,0x007f1c40,0x001f4000,0x008479f9,0x009f521f,0x007f4401,0x007f6001,
++  0x007f3905,0x009f6213,0x00725c08,0x009a1a1a,0x007f1e00,0x007f1c40,0x001f4000,0x007ff950,
++  0x009fd224,0x0089d223,0x00887a0d,0x000b4000,0x009f022c,0x007f6001,0x00044000,0x007f3820,
++  0x001f0800,0x000f0000,0x008fd233,0x000f2800,0x001f4000,0x000b0000,0x000d0000,0x002a30a0,
++  0x00641c20,0x001f4000,0x00010000,0x00655c05,0x0065081b,0x00050800,0x00854a60,0x00854a63,
++  0x00854a64,0x00854a67,0x009f4a66,0x009f4a67,0x009f4a66,0x009f4a67,0x00641c40,0x001f4000,
++  0x00050000,0x00050000,0x00050000,0x00792401,0x009f7a5d,0x00610b6b,0x007f1140,0x007f5c05,
++  0x007f3882,0x00ff7b3f,0x007f4401,0x007f7953,0x007f6e5f,0x007f7809,0x007f7850,0x009f627f,
++  0x00864a87,0x007f3a04,0x009f6aee,0x007f6e6f,0x009f4a8f,0x007f781f,0x009f7ac5,0x007f7848,
++  0x007f780b,0x009f7a9f,0x009f6295,0x00643a04,0x009f0327,0x013f2a98,0x00cc629d,0x00693820,
++  0x0089d2a1,0x00895ab4,0x01283294,0x007f6eef,0x007f2008,0x007f7808,0x007f1c02,0x007f7956,
++  0x007f4001,0x0083792b,0x00686f6f,0x007f780b,0x007f2004,0x007f4001,0x013f306e,0x009f7b0d,
++  0x009f0327,0x00c62ac0,0x00693820,0x0129d2c7,0x00895adc,0x008832c2,0x007f6eef,0x007f2008,
++  0x007f7808,0x007f1c02,0x007f7956,0x007f4001,0x0083293f,0x009f793d,0x00686f6f,0x007f781f,
++  0x007f2004,0x007f4001,0x009f3080,0x009f7b0d,0x009f0327,0x009f2ae8,0x00060000,0x00693820,
++  0x0089d2f1,0x00895b00,0x00c82aef,0x009f32e8,0x007f7952,0x00636ebf,0x009f2951,0x009f794b,
++  0x00686f5f,0x007f7807,0x007f2004,0x007f4001,0x009f288f,0x009f308c,0x007f0b0b,0x007f3905,
++  0x009f6311,0x009a1317,0x00040000,0x009a1b1a,0x007f1e00,0x009a2320,0x007f3903,0x009f631f,
++  0x007f1c20,0x007f1c40,0x001f4000,0x009f532c,0x00989183,0x0098b0e9,0x007f4401,0x007f6001,
++  0x007f3905,0x009f6333,0x00725c08,0x009a1b3a,0x007f1e00,0x007f1c40,0x001f4000,0x009a0344,
++  0x007f3903,0x009f6343,0x009a0b48,0x007f1e00,0x007f3905,0x009b3b4f,0x009b0b50,0x009a2b77,
++  0x007f2c01,0x007f2c05,0x007f2c05,0x007f0400,0x007f4001,0x009f635b,0x001f0001,0x007f0b0b,
++  0x007f4401,0x007f3905,0x009f6365,0x009a136b,0x00040000,0x009a1b6e,0x007f1e00,0x009a2374,
++  0x007f3903,0x009f6373,0x001f0001,0x009f6377,0x007f6d7f,0x007f096b,0x007f78c4,0x007f7807,
++  0x007f3a04,0x009f6b8a,0x007f2001,0x009f7b8b,0x00c52b95,0x009f00cf,0x009f138a,0x007f3a04,
++  0x009f6b91,0x00060000,0x0067b900,0x00671c82,0x00876399,0x00875389,0x00050000,0x001f1800,
++  0x009f4bab,0x007f3a04,0x009f6ba5,0x00053000,0x00857b9f,0x007f0b6b,0x007f3820,0x007f78cc,
++  0x009b389b,0x009f7b51,
++};
++static const uint8_t nvt_spi_cfgidx_10030000[66] = {
++  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,
++};
++static const uint32_t nvt_spi_cfgval_10030000[66] = {
++  0x00000000,0x00000400,0x00000000,0x00000000,0x00240e78,0x00011088,0x00240007,0x00000000,
++  0x00000000,0x0001000a,0x00000300,0x00000000,0x00000000,0x00000000,0x00154400,0x001483a0,
++  0x00aa8128,0x00641002,0x00000000,0x00000201,0x0001fe05,0x0002c2e7,0x0a435c00,0x0010011a,
++  0x08800000,0x00000000,0x100caff7,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x000018e4,0x00000000,0x00000003,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x0007f807,0x000ffefe,0x00000000,0x00000000,0x00000000,
++  0x00000000,0x00300000,0x00000000,0x00000009,0x0007f807,0x000ffefe,0x00000000,0x00000000,
++  0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x0000013f,
++  0x00000000,0x00000000,
++};
++
++struct nvt_spi_fw { uint32_t core, fwver, cfgver, fwcnt, cfgcnt;
++  const uint32_t *fw; const uint8_t *cfgidx; const uint32_t *cfgval; };
++static const struct nvt_spi_fw nvt_spi_fw_tbl[] = {
++  { 0x10020000u, 12801u, 7u, 475u, 66u, nvt_spi_fw_10020000, nvt_spi_cfgidx_10020000, nvt_spi_cfgval_10020000 },
++  { 0x10030000u, 12800u, 7u, 474u, 66u, nvt_spi_fw_10030000, nvt_spi_cfgidx_10030000, nvt_spi_cfgval_10030000 },
++};
++
 +static struct {
-+	vm_offset_t gcc, gpio, se;
++	vm_offset_t gcc, gpio, se, wrap;
 +	bool started, dead;
-+	unsigned clk_div, tx_depth;
-+	int ax_max, ay_max;                 /* reported panel resolution */
++	unsigned clk_div, tx_depth, rx_depth;
++	int ax_max, ay_max;
 +	uint32_t irq_status, active;
 +	int x[NT_MAX], y[NT_MAX];
 +} st;
@@ -172,6 +371,18 @@
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(base + off) = val;
 +	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++nt_set(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	nt_wr(base, off, nt_rd(base, off) | bits);
++}
++
++static void
++nt_clr(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	nt_wr(base, off, nt_rd(base, off) & ~bits);
 +}
 +
 +static void
@@ -209,12 +420,11 @@
 +static bool
 +nt_clocks(void)
 +{
-+	/* Vote wrap2 SE2 serial clock plus wrap2 m-ahb/s-ahb, keep other users. */
 +	nt_wr(st.gcc, NT_GCC_VOTE, nt_rd(st.gcc, NT_GCC_VOTE) | NT_VOTE_MASK);
 +	uint32_t cfg = nt_rd(st.gcc, NT_RCG + 4u);
 +	printf("SWEET NABU-TOUCH: vote=%#x rcg=%#x cfg=%#x\n",
 +	    nt_rd(st.gcc, NT_GCC_VOTE), nt_rd(st.gcc, NT_RCG), cfg);
-+	/* XO source (src 0), divider 1 => 19.2 MHz core clock. No PLL change. */
++	/* XO source (src 0), divider 1 => 19.2 MHz core clock. */
 +	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
 +	nt_wr(st.gcc, NT_RCG + 4u, cfg);
 +	nt_wr(st.gcc, NT_RCG, nt_rd(st.gcc, NT_RCG) | 1u);
@@ -225,49 +435,98 @@
 +	return true;
 +}
 +
++/*
++ * Load the GENI SPI serial-engine firmware into SE19's config RAM. Verbatim
++ * order from the mainline SE-FW-load patch; the image is the device's own.
++ * Returns true if the SE afterwards reports the SPI protocol.
++ */
++static bool
++nt_load_fw(void)
++{
++	uint32_t hwver = nt_rd(st.wrap, NT_QUP_HW_VER);
++	const struct nvt_spi_fw *img = NULL;
++	for (unsigned i = 0; i < sizeof(nvt_spi_fw_tbl) / sizeof(nvt_spi_fw_tbl[0]); ++i) {
++		if (nvt_spi_fw_tbl[i].core == hwver) {
++			img = &nvt_spi_fw_tbl[i];
++		}
++	}
++	printf("SWEET NABU-TOUCH: qup_hw_ver=%#x -> %s fw\n", hwver,
++	    img ? "matched" : "NO-MATCH");
++	if (!img) {
++		return false;
++	}
++	/* Wrapper common clock-gating. */
++	nt_set(st.wrap, NT_WRAP_COMMON_CFG, FAST_SWITCH_HIGH);
++	nt_set(st.wrap, NT_WRAP_SE_AHB_M_CFG, AHB_M_CLK_CGC_ON);
++	nt_set(st.wrap, NT_WRAP_COMMON_CGC, COMMON_SLV_CGC_ON);
++	/* Prepare SE for RAM programming. */
++	nt_wr(st.se, G_OUTPUT_CTRL, 0);
++	nt_set(st.se, G_CGC_CTRL, PROG_RAM_OFF);
++	nt_wr(st.se, G_CLK_CTRL, 0);
++	nt_clr(st.se, G_CGC_CTRL, PROG_RAM_OFF);
++	nt_set(st.se, G_DMA_GEN_CFG, DMA_CGC_ON);
++	nt_wr(st.se, G_CGC_CTRL, DEFAULT_CGC_EN);
++	nt_wr(st.se, G_INIT_CFG_REV, img->cfgver);
++	nt_wr(st.se, G_S_INIT_CFG_REV, img->cfgver);
++	for (uint32_t i = 0; i < img->cfgcnt; ++i) {
++		nt_wr(st.se, G_CFG_REG0 + (uint32_t)img->cfgidx[i] * 4u, img->cfgval[i]);
++	}
++	nt_wr(st.se, G_RX_RFR_WM, st.rx_depth > 2 ? st.rx_depth - 2u : 0u);
++	nt_wr(st.se, G_OUTPUT_CTRL, DEFAULT_IO_OUT);
++	nt_wr(st.se, G_DMA_MODE_EN, 0);          /* FIFO mode */
++	/* Protocol + version (SPI=1 in bits[15:8], version low byte). */
++	uint32_t rev = (1u << 8) | (img->fwver & 0xffu);
++	nt_wr(st.se, G_FW_REVISION, rev);
++	nt_wr(st.se, G_S_FW_REVISION, rev);
++	/* Copy firmware words into the config RAM. */
++	for (uint32_t i = 0; i < img->fwcnt; ++i) {
++		nt_wr(st.se, G_CFG_RAMN + i * 4u, img->fw[i]);
++	}
++	nt_wr(st.se, G_FORCE_DEFAULT, 1);
++	nt_set(st.se, G_CGC_CTRL, PROG_RAM_OFF);
++	nt_set(st.se, G_CLK_CTRL, SER_CLK_SEL);
++	nt_clr(st.se, G_CGC_CTRL, PROG_RAM_OFF);
++	nt_set(st.se, G_DMA_IF_EN, DMA_IF_EN_BIT);
++	nt_clr(st.se, G_FIFO_IF_DIS, FIFO_IF_DISABLE);   /* FIFO mode */
++	uint32_t fw = nt_rd(st.se, G_FW_REV);
++	printf("SWEET NABU-TOUCH: after load fw=%#x proto=%u (want 1)\n",
++	    fw, (fw >> 8) & 0xffu);
++	return ((fw >> 8) & 0xffu) == 1u;
++}
++
 +static bool
 +nt_se_init(void)
 +{
 +	uint32_t fw = nt_rd(st.se, G_FW_REV);
 +	uint32_t proto = (fw >> 8) & 0xffu;
-+	uint32_t hw0 = nt_rd(st.se, G_HW_PARAM_0);
-+	st.tx_depth = (hw0 >> 16) & 0x3fu;
-+	printf("SWEET NABU-TOUCH: se fw=%#x proto=%u (1=SPI) status=%#x tx_depth=%u\n",
-+	    fw, proto, nt_rd(st.se, G_STATUS), st.tx_depth);
++	printf("SWEET NABU-TOUCH: se fw=%#x proto=%u (1=SPI) status=%#x tx_depth=%u rx_depth=%u\n",
++	    fw, proto, nt_rd(st.se, G_STATUS), st.tx_depth, st.rx_depth);
 +	if (proto != 1u) {
-+		printf("SWEET NABU-TOUCH: SE19 is not SPI (need ABL qup19 SPI fw); stop\n");
++		printf("SWEET NABU-TOUCH: SE19 not SPI after fw load; stop\n");
 +		return false;
 +	}
-+	if (st.tx_depth < 2u || st.tx_depth > 32u) {
-+		st.tx_depth = 16u;
-+	}
-+	/* Route to FIFO, mask GSI, poll local M_IRQ status. */
 +	nt_wr(st.se, G_GSI_EVENT_EN, 0);
 +	nt_wr(st.se, G_IRQ_EN, 0);
 +	nt_wr(st.se, G_DMA_MODE_EN, 0);
 +	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
 +	nt_wr(st.se, G_S_IRQ_CLR, 0xffffffffu);
-+	/* Clock-gating + IO enable, in sweet's proven order before FORCE_DEFAULT. */
-+	nt_wr(st.se, G_CGC_CTRL, nt_rd(st.se, G_CGC_CTRL) | 0x7fu);
-+	nt_wr(st.se, G_SE_CLK_CTRL, nt_rd(st.se, G_SE_CLK_CTRL) | 0x0fu);
-+	nt_wr(st.se, G_OUTPUT_CTRL, 0x7fu);
-+	nt_wr(st.se, G_FORCE_DEFAULT, 1);
-+	nt_wr(st.se, G_CLK_SEL, 0);
-+	/* MSB-first packing, four 8-bit words per 32-bit FIFO entry.
-+	 * geni_se_config_packing(bpw=8, pack=4, msb=true) computes these. */
++	nt_set(st.se, G_CGC_CTRL, DEFAULT_CGC_EN);
++	nt_set(st.se, G_DMA_GEN_CFG, DMA_CGC_ON);
++	nt_wr(st.se, G_OUTPUT_CTRL, DEFAULT_IO_OUT);
++	/* MSB-first packing, four 8-bit words per 32-bit FIFO entry. */
 +	nt_wr(st.se, G_BYTE_GRAN, 0);
 +	nt_wr(st.se, G_TX_PACK0, 0x0007f8feu);
 +	nt_wr(st.se, G_TX_PACK1, 0x000ffefeu);
 +	nt_wr(st.se, G_RX_PACK0, 0x0007f8feu);
 +	nt_wr(st.se, G_RX_PACK1, 0x000ffefeu);
-+	nt_wr(st.se, SPI_WORD_LEN, 8u - 4u);        /* (bits_per_word - 4) */
-+	nt_wr(st.se, SPI_CPOL, 0);                  /* SPI mode 0 */
++	nt_wr(st.se, SPI_WORD_LEN, 8u - 4u);
++	nt_wr(st.se, SPI_CPOL, 0);
 +	nt_wr(st.se, SPI_CPHA, 0);
 +	nt_wr(st.se, SPI_DEMUX_INV, 0);
-+	nt_wr(st.se, SPI_DEMUX_SEL, 0);             /* CS0 */
-+	nt_wr(st.se, SPI_TRANS_CFG, 0);             /* manual CS via CS_ASSERT cmd */
++	nt_wr(st.se, SPI_DEMUX_SEL, 0);
++	nt_wr(st.se, SPI_TRANS_CFG, 0);
 +	nt_wr(st.se, SPI_PRE_POST_DLY, 0);
-+	/* Serial clock = 19.2 MHz / clk_div. */
++	nt_wr(st.se, G_CLK_SEL, 0);
 +	nt_wr(st.se, G_SER_M_CLK_CFG, (st.clk_div << 4) | 1u);
 +	nt_wr(st.se, G_M_IRQ_EN,
 +	    M_CMD_DONE | M_RX_WATERMARK | M_RX_LAST | M_TX_WATERMARK | M_ERRORS);
@@ -287,7 +546,6 @@
 +	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
 +}
 +
-+/* One M_CMD with no data (CS assert/deassert). */
 +static int
 +nt_cmd(unsigned opcode)
 +{
@@ -305,10 +563,7 @@
 +	return ETIMEDOUT;
 +}
 +
-+/*
-+ * Full-duplex FIFO transfer of n bytes (n <= 96). tx may be NULL (clock out
-+ * zeros); rx may be NULL (discard). CS is asserted around the data command.
-+ */
++/* Full-duplex FIFO transfer of n bytes (n <= 96). CS bracketed by M_CMDs. */
 +static int
 +nt_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
 +{
@@ -324,10 +579,10 @@
 +		return EIO;
 +	}
 +	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
-+	nt_wr(st.se, SPI_TX_TRANS_LEN, n);          /* words == bytes for 8-bit */
++	nt_wr(st.se, SPI_TX_TRANS_LEN, n);
 +	nt_wr(st.se, SPI_RX_TRANS_LEN, n);
 +	nt_wr(st.se, G_M_CMD0, ((OP_TX | OP_RX) << OP_SHIFT) | FRAGMENTATION);
-+	nt_wr(st.se, G_TX_WATERMARK, 1);            /* start TX watermark IRQ */
++	nt_wr(st.se, G_TX_WATERMARK, 1);
 +	unsigned sent = 0, got = 0;
 +	int err = ETIMEDOUT;
 +	for (unsigned i = 0; i < 50000; ++i) {
@@ -337,13 +592,11 @@
 +			err = EIO;
 +			break;
 +		}
-+		/* Fill TX FIFO up to (depth-1) words while bytes remain. */
 +		if (sent < n && (irq & M_TX_WATERMARK)) {
 +			unsigned room = (st.tx_depth - 1u) * 4u;
 +			while (sent < n && room) {
 +				uint32_t word = 0;
-+				unsigned j;
-+				for (j = 0; j < 4u && sent < n; ++j) {
++				for (unsigned j = 0; j < 4u && sent < n; ++j) {
 +					word |= (uint32_t)(tx ? tx[sent] : 0) << (8u * j);
 +					++sent;
 +				}
@@ -354,7 +607,6 @@
 +				nt_wr(st.se, G_TX_WATERMARK, 0);
 +			}
 +		}
-+		/* Drain RX FIFO. */
 +		uint32_t count = nt_rd(st.se, G_RX_FIFO_STATUS) & RX_WC_MSK;
 +		while (count--) {
 +			uint32_t word = nt_rd(st.se, G_RX_FIFO);
@@ -380,7 +632,6 @@
 +	return err;
 +}
 +
-+/* Novatek page select (3-byte write). */
 +static int
 +nt_set_page(uint32_t addr)
 +{
@@ -425,11 +676,6 @@
 +	return err;
 +}
 +
-+/*
-+ * Read len data bytes from the current page starting at in-page offset off.
-+ * Mirrors CTP_SPI_READ: command byte + DUMMY byte precede the data on the
-+ * wire, so transfer len+1 and return rx[2 ..] as the data.
-+ */
 +static int
 +nt_read(uint32_t addr, uint8_t off, uint8_t *data, unsigned len)
 +{
@@ -447,7 +693,7 @@
 +		return err;
 +	}
 +	for (unsigned i = 0; i < len; ++i) {
-+		data[i] = rx[2u + i];       /* skip command echo + 1 dummy */
++		data[i] = rx[2u + i];
 +	}
 +	return 0;
 +}
@@ -481,14 +727,14 @@
 +		return err;
 +	}
 +	for (unsigned i = 0; i < NT_MAX; ++i) {
-+		const uint8_t *p = d + 6u * i;          /* Novatek point_data[1+6*i] */
++		const uint8_t *p = d + 6u * i;
 +		unsigned id = p[0] >> 3;
 +		unsigned status = p[0] & 0x07u;
 +		if (id == 0 || id > NT_MAX) {
 +			continue;
 +		}
 +		if (status != 0x01u && status != 0x02u) {
-+			continue;                           /* not a down/move record */
++			continue;
 +		}
 +		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4);
 +		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
@@ -497,7 +743,6 @@
 +		}
 +		unsigned f = id - 1u;
 +		mask |= 1u << f;
-+		/* Scale panel coords to the range SweetHID normalizes against. */
 +		x[f] = (int)(px * NT_HID_X / (unsigned)st.ax_max);
 +		y[f] = (int)(py * NT_HID_Y / (unsigned)st.ay_max);
 +	}
@@ -517,11 +762,34 @@
 +	st.gcc = ml_io_map(NT_GCC_PA, 0x60000);
 +	st.gpio = ml_io_map(NT_TLMM_PA, 0x40000);
 +	st.se = ml_io_map(NT_SE_PA, 0x4000);
-+	if (!st.gcc || !st.gpio || !st.se) {
++	st.wrap = ml_io_map(NT_WRAP_PA, 0x1000);
++	if (!st.gcc || !st.gpio || !st.se || !st.wrap) {
 +		printf("SWEET NABU-TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
-+	if (!nt_clocks() || !nt_se_init()) {
++	if (!nt_clocks()) {
++		goto out;
++	}
++	uint32_t hw0 = nt_rd(st.se, G_HW_PARAM_0);
++	uint32_t hw1 = nt_rd(st.se, G_HW_PARAM_1);
++	st.tx_depth = (hw0 >> 16) & 0x3fu;
++	st.rx_depth = (hw1 >> 16) & 0x3fu;
++	if (st.tx_depth < 2u || st.tx_depth > 32u) {
++		st.tx_depth = 16u;
++	}
++	if (st.rx_depth < 2u || st.rx_depth > 32u) {
++		st.rx_depth = 16u;
++	}
++	/* If ABL left the I2C firmware (proto!=1), load the SPI SE firmware. */
++	uint32_t proto = (nt_rd(st.se, G_FW_REV) >> 8) & 0xffu;
++	if (proto != 1u) {
++		printf("SWEET NABU-TOUCH: SE19 proto=%u, loading GENI SPI firmware\n", proto);
++		if (!nt_load_fw()) {
++			printf("SWEET NABU-TOUCH: SPI firmware load failed; stop\n");
++			goto out;
++		}
++	}
++	if (!nt_se_init()) {
 +		goto out;
 +	}
 +	/* gpio55-58 -> qup19 (mux 2), 6 mA, no internal pull. */
@@ -532,7 +800,6 @@
 +	nt_wait(20);
 +	st.ax_max = 1600;
 +	st.ay_max = 2560;
-+	/* Comms + firmware check: FWINFO block (valid when fw_ver + ~fw_ver = 0xff). */
 +	uint8_t fi[17] = { 0 };
 +	int fe = nt_read(NVT_EVENT_BUF, NVT_FWINFO_OFF, fi, sizeof(fi));
 +	printf("SWEET NABU-TOUCH: fwinfo err=%d ver=%02x inv=%02x xy=%u,%u res=%u,%u irq=%#x\n",
@@ -547,7 +814,7 @@
 +		}
 +		printf("SWEET NABU-TOUCH: firmware live, panel %dx%d\n", st.ax_max, st.ay_max);
 +	} else {
-+		printf("SWEET NABU-TOUCH: no valid fwinfo; will still poll (coords 1600x2560)\n");
++		printf("SWEET NABU-TOUCH: no valid fwinfo; polling anyway (1600x2560)\n");
 +	}
 +	unsigned errors = 0;
 +	while (!st.dead) {
@@ -557,7 +824,7 @@
 +				printf("SWEET NABU-TOUCH: poll err=%d irq=%#x\n", err, st.irq_status);
 +			}
 +			if (errors == 20) {
-+				nt_report(0, st.x, st.y);   /* release on persistent failure */
++				nt_report(0, st.x, st.y);
 +			}
 +		} else {
 +			errors = 0;
@@ -573,8 +840,8 @@
 +void
 +nabu_touch_init(void)
 +{
-+	int enabled = 0;            /* default off: only nabu sets nabutouch=1 */
-+	int div = 8;                /* 19.2 MHz / 8 = 2.4 MHz SCK (register-safe) */
++	int enabled = 0;
++	int div = 8;
 +	thread_t thread;
 +	if (st.started) {
 +		return;
