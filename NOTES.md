@@ -2,6 +2,197 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-19 (nabu TOUCH driver written — patch 0083, read first) <<<
+
+Milestone before this: **full-screen iOS 16 GUI renders on nabu** (SpringBoard,
+patch 0082 scales the iPhone-X 1125x2436 logical frame onto the 1600x2560 panel;
+user confirmed "РАБОТАЕТ!"). Wallpaper is still black (PosterBoard has no seeded
+default poster) but icons render and the home screen is there. Next: **touch**.
+
+**What I wrote (not yet CI-built or tested):** `xnu/patches/0083-nabu-novatek-spi-touch.patch`
+creates `bsd/dev/nabu_touch.c`, a Novatek **NT36523** driver on **GENI SPI SE19**
+(nabu's panel), and wires `nabu_touch_init()` into `sweet_ufs.c` next to
+`sweet_touch_init()`. It is SEPARATE from `sweet_touch.c` (Goodix/FTS *I2C* on
+SE7, which is sweet-only) so sweet is untouched. Gated by boot-arg **`nabutouch=1`**
+(default off); on nabu also pass **`sweettouch=0`** so the SE7 I2C probe doesn't run.
+
+Hardware facts it is built on (all verified from Linux v6.6 + the MiCode nabu
+vendor kernel, not guessed):
+- SE19 = QUPv3 **wrap2 S2**. Clk branch vote `GCC 0x52014` (s-clk BIT6, m-ahb
+  BIT2, s-ahb BIT1); RCG `0x1e3a8` set to XO (19.2 MHz); SE base `0xc88000`.
+- Pins **gpio55-58** = SOUTH TLMM tile (**base 0x03d00000**, ctl = pin*0x1000),
+  func **qup19 = mux 2**; ctl field layout identical to sweet's `touch_gpio`.
+- GENI SPI: proto=1, mode-0 (CPOL=0/CPHA=0), word_len=4 (8-bit), MSB-first
+  packing CFG0=`0x7f8fe`/CFG1=`0xffefe` (computed from geni_se_config_packing),
+  CS via CS_ASSERT(8)/CS_DEASSERT(9) M_CMDs, data opcode TX(1)|RX(2) +
+  FRAGMENTATION, opcode<<27. SCK = 19.2MHz / `nabutouchdiv` (default 8 = 2.4MHz).
+- NT36523: EVENT_BUF_ADDR `0x2FE00`, read=clear bit7 / write=set bit7, 1 dummy
+  byte, parse 6 bytes/finger (id=p[0]>>3, down if p[0]&7 in {1,2},
+  x=(p[1]<<4)|(p[3]>>4), y=(p[2]<<4)|(p[3]&0xf)), panel 1600x2560.
+- `sweet_hid_touch(finger,down,x,y)` (SweetHID) normalizes x/1080, y/2400, so the
+  driver scales Novatek 1600x2560 down to 1080x2400 before calling it.
+
+**Driver strategy (first version, written blind):** it does NOT reset the IC or
+download firmware — it assumes Android's firmware stays resident across the
+`fastboot boot` (touch rail stays powered, ABL doesn't pulse reset). On start
+(boot-arg `nabutouchdelay`, default 45 s) it brings up the SE19 clock/GPIO/SPI,
+reads the FWINFO block (EVENT_BUF+0x78) to confirm SPI comms + firmware liveness
+(valid when fw_ver + ~fw_ver == 0xff), then polls the event buffer every 10 ms.
+Expect iteration: the first boot's `SWEET NABU-TOUCH:` log lines tell us whether
+(a) SE19 is SPI-proto, (b) FWINFO reads back sane (fw live), (c) events parse.
+Likely follow-ups if dead: add the reset-GPIO pulse + Novatek bootloader/FW
+download (big), or tune `nabutouchdiv`. Coordinate calibration comes after reports.
+
+Locally verified: driver compiles clean (clang -fsyntax-only, 0 warnings),
+packing constants reproduced by script, and `git apply --check` of 0083 passes.
+
+**Next concrete action:** push patch 0083, run the CI kernel build, rebuild the
+shim payload, `fastboot boot`, and read the `SWEET NABU-TOUCH:` lines from the
+persistent log (it reaches GUI so the on-screen/log path is available). Add
+`nabutouch=1 sweettouch=0` to the nabu cmdline; keep `nabutouchdelay=45`.
+
+### >>> UPDATE 2026-10-19 (nabu = Xiaomi Pad 5 bring-up, read first) <<<
+
+Porting moved to a second device, **nabu (Xiaomi Pad 5, SM8150/Snapdragon 860)**,
+built and driven entirely from a **Mac** (not the Linux box): `fastboot`/`adb`
+via Homebrew, root image built on macOS (`tools/mkiosroot_mac.sh`), kernel/shim
+unchanged (kernel **0080** in `shim/out/payload.bin`, ADT `shim/out/nabu.adt`
+highmem dram-base 0x100000000, display 1600x2560 @scale2). IPSW used:
+`iPhone10,3_16.7.10_20H350` (NB: proven sweet images were 20H392).
+
+**What works now on nabu (observations, 2026-10-19):** root HFS mounts, Apple
+`launchd` (Darwin Bootstrapper 7.0.0) runs, `entering ondemand mode`, runs boot
+tasks. Display + touch + UFS + 6 CPUs come up. Got here by fixing three bugs in
+the macOS root-build path:
+1. **launchd SIGSEGV (ns 2 subcode 0xb)** right after libignition: the macOS
+   `mkiosroot_mac.sh` did NOT flatten the cryptexes into the OS root, so
+   `/usr/lib/libobjc-trampolines.dylib` (and libffi-trampolines, libstdc++…)
+   existed only under `/private/preboot/Cryptexes/OS`. At `ignition_level=1`
+   dyld does not search the cryptexes -> Obj-C runtime (launchd) can't load
+   libobjc-trampolines -> SIGSEGV. FIXED: added the cryptex-flatten step to
+   `tools/mkiosroot_mac.sh` (mirror of `mkiosroot.sh` lines 81-96).
+2. **root won't mount ("unknown Volume Signature : 2873")**: `hdiutil convert
+   -format UDRW` / `hdiutil create` wrap the volume in a GPT (protective MBR +
+   EFI + Apple_HFS); the kernel expects a BARE HFS at the start of userdata.
+   FIXED: `mkiosroot_mac.sh` now dd's out the Apple_HFS partition (bare HFSX,
+   sig 'HX' 0x4858). To flash an existing GPT image, extract s2:
+   `hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage IMG`,
+   `dd if=/dev/diskNs2 of=bare.raw`, `img2simg bare.raw bare.simg`.
+3. **DataMigration ran forever**: `sweet-root-tweaks.py` hardcoded BUILD=20H392
+   but the IPSW is 20H350, so `com.apple.migration` LastSystemVersion != the
+   running build -> 1-hour migration every boot. FIXED: the script now reads
+   ProductBuildVersion/ProductVersion from the image's SystemVersion.plist.
+
+Known-good flashable image: **`/Volumes/Work/ios-sweet-storage/ios16-hfs-v2.simg`**
+(11.6 GB, bare HFSX, all three fixes). Flash full, no `-S`:
+`fastboot flash userdata ios16-hfs-v2.simg` then `fastboot boot shim/out/shim-boot.img`.
+nabu userdata = `/dev/block/sda33`, 38493 MiB; the iOS HFS is the first 12.5 GB.
+Recovery with adb = `~/Downloads/CN_V4-MODDED-TWRP-WINDOWS-03-05.img`
+(`fastboot boot` it, non-destructive).
+
+**CURRENT WALL: the system hangs on the boot-task `mount` — most likely a
+UFS/VFS deadlock, not merely "SpringBoard won't start".** Evidence (2026-10-19,
+image `shim/out/shim-boot-log1.img` = rw + `ufslogsecs=1`, log
+`logs/nabu-log1.txt`): everything up to the dyld shared-cache mapping is
+HEALTHY — `hfs: mounted iOSRoot`, `exec launchd`, libignition completes cleanly
+(`goodbye: ignition sequence complete`; it finds the cache via the hardlinked
+`/System/Library/Caches/com.apple.dyld`, ignition level 1, cryptex graft
+skipped as designed), dyld maps all 42 cache files. On screen, launchd then
+reaches `entering ondemand mode` -> `Doing boot task` -> `exec mount`, after
+which NO further process is exec'd and `SMP --- sample N` shows no
+SpringBoard/backboardd. Crucially, with `ufslogsecs=1` the persistent-log thread
+flushed exactly ONCE (seq 1, 15801 bytes, up to the shared-cache mapping) and
+then NEVER again across 60+ s — if this were just the old 10 s interval there
+would be many flushes. One-flush-then-stuck means the UFS engine itself stops
+servicing the log thread after the shared-cache phase, i.e. the `mount` boot
+task deadlocks the polled UFS / VFS and takes the log thread (which needs
+`sweet_ufs_lock`) down with it. So the real bug to chase is the UFS/mount
+deadlock, on the build box with the xnu source. First diagnostic to add there:
+make patch 0042's `exec NAME` also print argv (to see exactly what `/sbin/mount`
+is invoked with), and/or give the log thread a dedicated UFS command slot so it
+keeps flushing through the deadlock.
+
+**BLOCKER TO ALL FURTHER DEBUG — no post-mount log channel on nabu:**
+- The persistent console ring (patch 0047, last 1025 blocks of userdata, pulled
+  with `tools/sweet-log-pull.sh`) **stops writing once the HFS root is mounted**
+  (raw block writes to the mounted partition don't go through). It only captures
+  the pre-mount kernel phase. `sweet-log-pull.sh`'s `stat -c` is a GNU-ism and
+  errors harmlessly on macOS (the .bin + decode still work).
+- **USB live log (`sweetusb=2`) resets nabu**: the kernel brings up `ue0`
+  192.168.7.2, then `SWEET USB: soft reset done` and the **device reboots**
+  before mounting root. nabu's DWC3 is `GSNPSID 0x33313130` vs sweet's
+  `0x5533320a`; the device-mode/CDC-ECM code (0073-0077, tuned for sweet) does
+  not work here and the soft reset resets the SoC. ue0 never enumerates on the
+  Mac host. Do NOT boot with sweetusb=2 on nabu.
+- NEXT STEP to unblock: a small kernel change (CI) so patch 0047 keeps flushing
+  the ring AFTER mount (or writes the console somewhere TWRP can read), OR wire
+  up hardware serial. Without it, every SpringBoard-phase question is blind and
+  each attempt costs a full 11.6 GB reflash.
+
+**HFS corruption trap:** the kernel mounts root rw; an unclean shutdown
+(force-reboot) corrupts the catalog (always `node=11458 fileID=4`,
+`catalog record #28 keyLength=78 expected=208`) and then root won't mount at all
+-> reflash clean. Also, **a second `fastboot boot shim-boot.img` on an already-rw
+FS overwrites the healthy boot's ring with mount-failure spam** — to capture a
+boot's log, go from the stalled boot STRAIGHT to TWRP, never re-boot the shim.
+Delta flashing (`sparsediff.py`) is UNSAFE after a rw boot (the phone diverges
+from the OLD baseline -> corrupts) — full-flash only.
+
+Tool fixes made this session (untracked, review before commit):
+`tools/mkiosroot_mac.sh` (cryptex flatten + bare-HFS extract),
+`tools/sweet-root-tweaks.py` (auto-detect build from SystemVersion.plist).
+
+### >>> UPDATE 2026-10-19 late (nabu: iOS GUI / SpringBoard renders) <<<
+
+**MILESTONE: SpringBoard runs and presents frames on nabu.** After the three
+root fixes (above) + two kernel/display fixes below, launchd brings up the full
+daemon set, backboardd opens IOCoreSurfaceRoot (software compositing, no GPU,
+same as sweet), and **SpringBoard swaps frames** (log `logs/nabu-px.txt`:
+`exec SpringBoard`, `SWEET FB: display on`, `SWEET FB: swap N ... surface
+1125x2436`). Furthest nabu has reached.
+
+Two fixes that got here (both this session, 2026-10-19):
+1. **Kernel patch 0081 (committed 05c6e77, CI run 39206877491): disable HFS
+   hotfile recording on SWEET** (`bsd/sweet_hfs/core/hfs_hotfiles.c`, early
+   return in `hfs_recording_init` under `ARM64_BOARD_CONFIG_SWEET`). The hotfile
+   B-tree creation was the catalog write that corrupted the macOS HFSX root and
+   deadlocked the polled UFS at the boot-task mount. With it gone, the log ring
+   now flushes continuously (no more UFS deadlock) — full post-mount logs via
+   TWRP work (`ufslogsecs=1`).
+2. **System keybag added to the root** (`tools/mkiosroot_mac.sh` now writes
+   `/private/var/keybags/systembag.kb` = plain-plist KeyBagKeys base64("SWEET"),
+   + the logd `/private/var/db/{diagnostics,uuidtext}` stores owned by _logd
+   272 with `.migrated`). Without systembag.kb, keybagd/MKB hit FATAL KEYBAG
+   ERROR -> reboot into recovery. (Added to the existing root in place for the
+   current flash: `ios16-hfs-v3.simg`.)
+3. **Display reverted to iPhone X 1125x2436** (reverted the nabu commit 12a0a09:
+   `tools/mkadt.py` display-scale 3 + canvas 1125x2436, patch 0061 LOGICAL
+   1125x2436). The nabu 1600x2560 presentation was wrong: the ABL cont_splash
+   framebuffer is actually **1080x2400** (`shim/console.h` FB_W/FB_H, stride
+   4320; confirmed `SWEET FB: AppleCLCD 1080x2400`), HW-scaled onto the 1600x2560
+   panel. Presenting 1600x2560 @2x on an iPhone-X (@3x) identity made backboardd
+   loop forever on `AppleM2ScalerCSCDriver` (no display scaler). 1125x2436
+   (iPhone X @3x) is consistent -> backboardd proceeds, no scaler needed. NEEDS
+   CI rebuild of the kernel (0061) + regenerate nabu.adt.
+
+**CURRENT WALL: the on-screen image is GARBLED** (blue noise in the top portion,
+not a clean UI; persists, not transient boot frames). Ruled out: the panel copy
+loop (`0046` `memcpy` at ~line 1286 uses the surface `bytesPerRow` 4608 for src
+and `fRowBytes` 4320 for dst correctly, center-crops via 0061 fOffX/fOffY 22/18),
+and the framebuffer/panel basics (the kernel text console writes the same
+`fPixels` cleanly). So the garble is the **surface CONTENT backboardd/SpringBoard
+renders** (or its mapping / present sync), not the blit or geometry — an
+iOS-render-side issue. Next: a kernel diagnostic (draw a test pattern into the
+panel AND dump the first surface pixels on present) to confirm FB-clean vs
+surface-garbage; check whether patch 0079 (display power/fade) or 0056 (throttled
+present from the vsync timer) regressed the present vs the 0069 home-screen path.
+
+**"Full-screen" note:** the nabu panel is 1600x2560 (aspect 5:8), which matches
+NO Apple device, so a valid iPhone-X UI is always letterboxed; the HW already
+upscales the 1080x2400 fb to fill the panel, so a CLEAN iPhone-X render would
+fill the screen (stretched). True iPad mode is NOT possible with this iPhone10,3
+IPSW (userland is iPhone's) — it would need an iPad IPSW and a full rebuild.
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

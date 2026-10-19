@@ -1,0 +1,597 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,3 +108,4 @@
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/nabu_touch.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -48,5 +48,6 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void nabu_touch_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -604,6 +605,7 @@
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	nabu_touch_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/nabu_touch.c
+@@ -0,0 +1,570 @@
++/*
++ * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
++ *
++ * Separate from sweet_touch.c (Goodix/FTS *I2C* on SE7): nabu's panel is a
++ * Novatek NT36523 on QUPv3 wrapper-2 SE2 (= "qup19", SPI) at 0x00c88000.
++ * Enabled by boot-arg nabutouch=1 (default off); on nabu also pass
++ * sweettouch=0 so the SE7 I2C probe does not run.
++ *
++ * Written blind for CI bring-up. It assumes the touch rail stays powered and
++ * the controller keeps the firmware Android loaded resident across the
++ * `fastboot boot` handoff (ABL does not pulse the touch reset): we do NOT
++ * reset the IC and do NOT download firmware here. First we confirm SPI comms
++ * by reading the firmware-info block (EVENT_BUF + 0x78); then we poll the
++ * event buffer and feed sweet_hid_touch().
++ *
++ * Only writes issued: the GENI SE config, the QUPv3 wrap2 clock vote/RCG, the
++ * gpio55-58 qup19 mux, and the Novatek page-select writes. No PMIC / RPMh.
++ *
++ * Register facts (Linux v6.6):
++ *   gcc-sm8150.c:   wrap2_s2 RCG cmd_rcgr 0x1e3a8; branch vote 0x52014
++ *                   (s2 clk BIT6, wrap_2 m-ahb BIT2, s-ahb BIT1).
++ *   pinctrl-sm8150: gpio55-58 SOUTH tile (base 0x03d00000), ctl = pin*0x1000,
++ *                   func qup19 = mux 2; mux_bit 2, pull_bit 0, drv_bit 6, oe 9.
++ *   spi-geni-qcom.c + qcom-geni-se.c: SPI register map, FIFO packing, M_CMD.
++ *   MiCode nabu nt36523: EVENT_BUF_ADDR 0x2FE00, SPI R/W bit7, 1 dummy byte.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void nabu_touch_init(void);
++
++/* GCC (shared with sweet): QUPv3 wrapper-2 SE2 = SE19. */
++#define NT_GCC_PA        0x00100000u
++#define NT_GCC_VOTE      0x52014u
++#define NT_VOTE_MASK     ((1u << 6) | (1u << 2) | (1u << 1)) /* s2, m-ahb, s-ahb */
++#define NT_RCG           0x1e3a8u            /* wrap2_s2 clk CMD_RCGR */
++/* TLMM SOUTH tile (SM8150): per-pin ctl = base + pin*0x1000, io = +4. */
++#define NT_TLMM_PA       0x03d00000u
++#define NT_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
++#define NT_GPIO_IO(n)    (NT_GPIO_CFG(n) + 4u)
++#define NT_SE_PA         0x00c88000u
++#define NT_MAX           10u
++
++/* GENI common (geni-se.h). */
++#define G_SER_M_CLK_CFG  0x048u
++#define G_FW_REV         0x068u
++#define G_STATUS         0x040u
++#define G_FORCE_DEFAULT  0x020u
++#define G_OUTPUT_CTRL    0x024u
++#define G_CGC_CTRL       0x028u
++#define G_CLK_SEL        0x07cu
++#define G_SE_CLK_CTRL    0xe30u
++#define G_BYTE_GRAN      0x254u
++#define G_DMA_MODE_EN    0x258u
++#define G_TX_PACK0       0x260u
++#define G_TX_PACK1       0x264u
++#define G_RX_PACK0       0x284u
++#define G_RX_PACK1       0x288u
++#define G_M_CMD0         0x600u
++#define G_M_CMD_CTRL     0x604u
++#define G_M_IRQ          0x610u
++#define G_M_IRQ_EN       0x614u
++#define G_M_IRQ_CLR      0x618u
++#define G_S_IRQ_CLR      0x648u
++#define G_TX_FIFO        0x700u
++#define G_RX_FIFO        0x780u
++#define G_TX_FIFO_STATUS 0x800u
++#define G_RX_FIFO_STATUS 0x804u
++#define G_TX_WATERMARK   0x80cu
++#define G_RX_RFR_WM      0x814u
++#define G_HW_PARAM_0     0xe24u           /* TX FIFO width/depth */
++#define G_HW_PARAM_1     0xe28u           /* RX FIFO width/depth */
++#define G_GSI_EVENT_EN   0xe18u
++#define G_IRQ_EN         0xe1cu
++/* SPI block (spi-geni-qcom.c). */
++#define SPI_CPHA         0x224u
++#define SPI_CPOL         0x230u
++#define SPI_DEMUX_INV    0x24cu
++#define SPI_DEMUX_SEL    0x250u
++#define SPI_TRANS_CFG    0x25cu
++#define SPI_WORD_LEN     0x268u
++#define SPI_TX_TRANS_LEN 0x26cu
++#define SPI_RX_TRANS_LEN 0x270u
++#define SPI_PRE_POST_DLY 0x274u
++/* M_CMD opcodes / fields. */
++#define OP_SHIFT         27u
++#define OP_TX            1u
++#define OP_RX            2u
++#define OP_CS_ASSERT     8u
++#define OP_CS_DEASSERT   9u
++#define FRAGMENTATION    (1u << 2)
++#define M_CMD_ABORT      (1u << 1)
++/* M_IRQ bits. */
++#define M_CMD_DONE       (1u << 0)
++#define M_CMD_FAILURE    (1u << 3)
++#define M_RX_WATERMARK   (1u << 26)
++#define M_RX_LAST        (1u << 27)
++#define M_TX_WATERMARK   (1u << 30)
++#define M_ERRORS         ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5))
++/* RX_FIFO_STATUS. */
++#define RX_WC_MSK        0x1ffffffu
++#define RX_LAST          (1u << 31)
++#define RX_LAST_VALID    (7u << 28)
++/* Novatek NT36523. */
++#define NVT_EVENT_BUF    0x2fe00u
++#define NVT_FWINFO_OFF   0x78u            /* EVENT_MAP_FWINFO */
++#define NVT_RD(a)        ((uint8_t)((a) & 0x7fu))   /* read: clear bit7 */
++#define NVT_WR(a)        ((uint8_t)((a) | 0x80u))   /* write: set bit7 */
++#define NVT_DUMMY        1u
++/* Logical maxima sweet_hid_touch() normalizes against (SweetHID /1080 /2400). */
++#define NT_HID_X         1080
++#define NT_HID_Y         2400
++
++static struct {
++	vm_offset_t gcc, gpio, se;
++	bool started, dead;
++	unsigned clk_div, tx_depth;
++	int ax_max, ay_max;                 /* reported panel resolution */
++	uint32_t irq_status, active;
++	int x[NT_MAX], y[NT_MAX];
++} st;
++static int nt_sleep_chan;
++
++static uint32_t
++nt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++nt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++nt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&nt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++nt_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(nt_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: identical field layout to sweet (mux<<2 | pull | drive<<6 | oe<<9). */
++static void
++nt_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive)
++{
++	uint32_t off = NT_GPIO_CFG(pin);
++	uint32_t cfg = nt_rd(st.gpio, off);
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6);
++	nt_wr(st.gpio, off, cfg);
++}
++
++static bool
++nt_clocks(void)
++{
++	/* Vote wrap2 SE2 serial clock plus wrap2 m-ahb/s-ahb, keep other users. */
++	nt_wr(st.gcc, NT_GCC_VOTE, nt_rd(st.gcc, NT_GCC_VOTE) | NT_VOTE_MASK);
++	uint32_t cfg = nt_rd(st.gcc, NT_RCG + 4u);
++	printf("SWEET NABU-TOUCH: vote=%#x rcg=%#x cfg=%#x\n",
++	    nt_rd(st.gcc, NT_GCC_VOTE), nt_rd(st.gcc, NT_RCG), cfg);
++	/* XO source (src 0), divider 1 => 19.2 MHz core clock. No PLL change. */
++	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++	nt_wr(st.gcc, NT_RCG + 4u, cfg);
++	nt_wr(st.gcc, NT_RCG, nt_rd(st.gcc, NT_RCG) | 1u);
++	if (!nt_wait_clear(st.gcc, NT_RCG, 1u)) {
++		printf("SWEET NABU-TOUCH: RCG update timeout\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++nt_se_init(void)
++{
++	uint32_t fw = nt_rd(st.se, G_FW_REV);
++	uint32_t proto = (fw >> 8) & 0xffu;
++	uint32_t hw0 = nt_rd(st.se, G_HW_PARAM_0);
++	st.tx_depth = (hw0 >> 16) & 0x3fu;
++	printf("SWEET NABU-TOUCH: se fw=%#x proto=%u (1=SPI) status=%#x tx_depth=%u\n",
++	    fw, proto, nt_rd(st.se, G_STATUS), st.tx_depth);
++	if (proto != 1u) {
++		printf("SWEET NABU-TOUCH: SE19 is not SPI (need ABL qup19 SPI fw); stop\n");
++		return false;
++	}
++	if (st.tx_depth < 2u || st.tx_depth > 32u) {
++		st.tx_depth = 16u;
++	}
++	/* Route to FIFO, mask GSI, poll local M_IRQ status. */
++	nt_wr(st.se, G_GSI_EVENT_EN, 0);
++	nt_wr(st.se, G_IRQ_EN, 0);
++	nt_wr(st.se, G_DMA_MODE_EN, 0);
++	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
++	nt_wr(st.se, G_S_IRQ_CLR, 0xffffffffu);
++	/* Clock-gating + IO enable, in sweet's proven order before FORCE_DEFAULT. */
++	nt_wr(st.se, G_CGC_CTRL, nt_rd(st.se, G_CGC_CTRL) | 0x7fu);
++	nt_wr(st.se, G_SE_CLK_CTRL, nt_rd(st.se, G_SE_CLK_CTRL) | 0x0fu);
++	nt_wr(st.se, G_OUTPUT_CTRL, 0x7fu);
++	nt_wr(st.se, G_FORCE_DEFAULT, 1);
++	nt_wr(st.se, G_CLK_SEL, 0);
++	/* MSB-first packing, four 8-bit words per 32-bit FIFO entry.
++	 * geni_se_config_packing(bpw=8, pack=4, msb=true) computes these. */
++	nt_wr(st.se, G_BYTE_GRAN, 0);
++	nt_wr(st.se, G_TX_PACK0, 0x0007f8feu);
++	nt_wr(st.se, G_TX_PACK1, 0x000ffefeu);
++	nt_wr(st.se, G_RX_PACK0, 0x0007f8feu);
++	nt_wr(st.se, G_RX_PACK1, 0x000ffefeu);
++	nt_wr(st.se, SPI_WORD_LEN, 8u - 4u);        /* (bits_per_word - 4) */
++	nt_wr(st.se, SPI_CPOL, 0);                  /* SPI mode 0 */
++	nt_wr(st.se, SPI_CPHA, 0);
++	nt_wr(st.se, SPI_DEMUX_INV, 0);
++	nt_wr(st.se, SPI_DEMUX_SEL, 0);             /* CS0 */
++	nt_wr(st.se, SPI_TRANS_CFG, 0);             /* manual CS via CS_ASSERT cmd */
++	nt_wr(st.se, SPI_PRE_POST_DLY, 0);
++	/* Serial clock = 19.2 MHz / clk_div. */
++	nt_wr(st.se, G_SER_M_CLK_CFG, (st.clk_div << 4) | 1u);
++	nt_wr(st.se, G_M_IRQ_EN,
++	    M_CMD_DONE | M_RX_WATERMARK | M_RX_LAST | M_TX_WATERMARK | M_ERRORS);
++	nt_wr(st.se, G_TX_WATERMARK, 0);
++	return true;
++}
++
++static void
++nt_abort(void)
++{
++	nt_wr(st.se, G_M_CMD_CTRL, M_CMD_ABORT);
++	(void)nt_wait_clear(st.se, G_STATUS, 1u);
++	for (unsigned i = 0; i < 64 && (nt_rd(st.se, G_RX_FIFO_STATUS) & RX_WC_MSK); ++i) {
++		(void)nt_rd(st.se, G_RX_FIFO);
++	}
++	nt_wr(st.se, G_TX_WATERMARK, 0);
++	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
++}
++
++/* One M_CMD with no data (CS assert/deassert). */
++static int
++nt_cmd(unsigned opcode)
++{
++	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
++	nt_wr(st.se, G_M_CMD0, opcode << OP_SHIFT);
++	for (unsigned i = 0; i < 5000; ++i) {
++		uint32_t irq = nt_rd(st.se, G_M_IRQ);
++		if (irq & (M_CMD_DONE | M_ERRORS)) {
++			nt_wr(st.se, G_M_IRQ_CLR, irq);
++			return (irq & M_CMD_DONE) ? 0 : EIO;
++		}
++		delay(1);
++	}
++	nt_abort();
++	return ETIMEDOUT;
++}
++
++/*
++ * Full-duplex FIFO transfer of n bytes (n <= 96). tx may be NULL (clock out
++ * zeros); rx may be NULL (discard). CS is asserted around the data command.
++ */
++static int
++nt_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	if (st.dead || n == 0 || n > 96) {
++		return EIO;
++	}
++	if (!nt_wait_clear(st.se, G_STATUS, 1u)) {
++		st.dead = true;
++		return EBUSY;
++	}
++	if (nt_cmd(OP_CS_ASSERT)) {
++		st.dead = true;
++		return EIO;
++	}
++	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
++	nt_wr(st.se, SPI_TX_TRANS_LEN, n);          /* words == bytes for 8-bit */
++	nt_wr(st.se, SPI_RX_TRANS_LEN, n);
++	nt_wr(st.se, G_M_CMD0, ((OP_TX | OP_RX) << OP_SHIFT) | FRAGMENTATION);
++	nt_wr(st.se, G_TX_WATERMARK, 1);            /* start TX watermark IRQ */
++	unsigned sent = 0, got = 0;
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 50000; ++i) {
++		uint32_t irq = nt_rd(st.se, G_M_IRQ);
++		st.irq_status = irq;
++		if (irq & (M_CMD_FAILURE | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5))) {
++			err = EIO;
++			break;
++		}
++		/* Fill TX FIFO up to (depth-1) words while bytes remain. */
++		if (sent < n && (irq & M_TX_WATERMARK)) {
++			unsigned room = (st.tx_depth - 1u) * 4u;
++			while (sent < n && room) {
++				uint32_t word = 0;
++				unsigned j;
++				for (j = 0; j < 4u && sent < n; ++j) {
++					word |= (uint32_t)(tx ? tx[sent] : 0) << (8u * j);
++					++sent;
++				}
++				nt_wr(st.se, G_TX_FIFO, word);
++				room -= 4u;
++			}
++			if (sent >= n) {
++				nt_wr(st.se, G_TX_WATERMARK, 0);
++			}
++		}
++		/* Drain RX FIFO. */
++		uint32_t count = nt_rd(st.se, G_RX_FIFO_STATUS) & RX_WC_MSK;
++		while (count--) {
++			uint32_t word = nt_rd(st.se, G_RX_FIFO);
++			for (unsigned j = 0; j < 4u && got < n; ++j) {
++				if (rx) {
++					rx[got] = (uint8_t)(word >> (8u * j));
++				}
++				++got;
++			}
++		}
++		if (irq & M_CMD_DONE) {
++			nt_wr(st.se, G_M_IRQ_CLR, irq);
++			err = (got >= n && sent >= n) ? 0 : EIO;
++			break;
++		}
++		nt_wr(st.se, G_M_IRQ_CLR, irq & (M_RX_WATERMARK | M_RX_LAST | M_TX_WATERMARK));
++		delay(1);
++	}
++	if (err) {
++		nt_abort();
++	}
++	(void)nt_cmd(OP_CS_DEASSERT);
++	return err;
++}
++
++/* Novatek page select (3-byte write). */
++static int
++nt_set_page(uint32_t addr)
++{
++	uint8_t buf[3] = { NVT_WR(0xffu), (uint8_t)((addr >> 15) & 0xffu),
++	    (uint8_t)((addr >> 7) & 0xffu) };
++	if (st.dead) {
++		return EIO;
++	}
++	if (!nt_wait_clear(st.se, G_STATUS, 1u)) {
++		st.dead = true;
++		return EBUSY;
++	}
++	if (nt_cmd(OP_CS_ASSERT)) {
++		st.dead = true;
++		return EIO;
++	}
++	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
++	nt_wr(st.se, SPI_TX_TRANS_LEN, sizeof(buf));
++	nt_wr(st.se, G_M_CMD0, (OP_TX << OP_SHIFT) | FRAGMENTATION);
++	nt_wr(st.se, G_TX_WATERMARK, 1);
++	uint32_t word = buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16);
++	nt_wr(st.se, G_TX_FIFO, word);
++	nt_wr(st.se, G_TX_WATERMARK, 0);
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = nt_rd(st.se, G_M_IRQ);
++		if (irq & M_ERRORS) {
++			err = EIO;
++			break;
++		}
++		if (irq & M_CMD_DONE) {
++			nt_wr(st.se, G_M_IRQ_CLR, irq);
++			err = 0;
++			break;
++		}
++		delay(1);
++	}
++	if (err) {
++		nt_abort();
++	}
++	(void)nt_cmd(OP_CS_DEASSERT);
++	return err;
++}
++
++/*
++ * Read len data bytes from the current page starting at in-page offset off.
++ * Mirrors CTP_SPI_READ: command byte + DUMMY byte precede the data on the
++ * wire, so transfer len+1 and return rx[2 ..] as the data.
++ */
++static int
++nt_read(uint32_t addr, uint8_t off, uint8_t *data, unsigned len)
++{
++	uint8_t tx[98] = { 0 }, rx[98] = { 0 };
++	unsigned total = len + 1u + NVT_DUMMY;
++	int err;
++	if (len == 0 || total > sizeof(tx)) {
++		return EIO;
++	}
++	if ((err = nt_set_page(addr)) != 0) {
++		return err;
++	}
++	tx[0] = NVT_RD(off);
++	if ((err = nt_xfer(tx, rx, total)) != 0) {
++		return err;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		data[i] = rx[2u + i];       /* skip command echo + 1 dummy */
++	}
++	return 0;
++}
++
++static void
++nt_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < NT_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++static int
++nt_poll(void)
++{
++	uint8_t d[64];
++	int x[NT_MAX] = { 0 }, y[NT_MAX] = { 0 };
++	uint32_t mask = 0;
++	int err = nt_read(NVT_EVENT_BUF, (uint8_t)(NVT_EVENT_BUF & 0x7fu), d, sizeof(d));
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < NT_MAX; ++i) {
++		const uint8_t *p = d + 6u * i;          /* Novatek point_data[1+6*i] */
++		unsigned id = p[0] >> 3;
++		unsigned status = p[0] & 0x07u;
++		if (id == 0 || id > NT_MAX) {
++			continue;
++		}
++		if (status != 0x01u && status != 0x02u) {
++			continue;                           /* not a down/move record */
++		}
++		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
++		if ((int)px > st.ax_max || (int)py > st.ay_max) {
++			continue;
++		}
++		unsigned f = id - 1u;
++		mask |= 1u << f;
++		/* Scale panel coords to the range SweetHID normalizes against. */
++		x[f] = (int)(px * NT_HID_X / (unsigned)st.ax_max);
++		y[f] = (int)(py * NT_HID_Y / (unsigned)st.ay_max);
++	}
++	nt_report(mask, x, y);
++	return 0;
++}
++
++static void
++nt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("nabutouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET NABU-TOUCH: starting in %u s (clk_div=%u)\n", delay_s, st.clk_div);
++	nt_wait(delay_s * 1000u);
++	st.gcc = ml_io_map(NT_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(NT_TLMM_PA, 0x40000);
++	st.se = ml_io_map(NT_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("SWEET NABU-TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!nt_clocks() || !nt_se_init()) {
++		goto out;
++	}
++	/* gpio55-58 -> qup19 (mux 2), 6 mA, no internal pull. */
++	nt_gpio(55, 2, 0, 2);
++	nt_gpio(56, 2, 0, 2);
++	nt_gpio(57, 2, 0, 2);
++	nt_gpio(58, 2, 0, 2);
++	nt_wait(20);
++	st.ax_max = 1600;
++	st.ay_max = 2560;
++	/* Comms + firmware check: FWINFO block (valid when fw_ver + ~fw_ver = 0xff). */
++	uint8_t fi[17] = { 0 };
++	int fe = nt_read(NVT_EVENT_BUF, NVT_FWINFO_OFF, fi, sizeof(fi));
++	printf("SWEET NABU-TOUCH: fwinfo err=%d ver=%02x inv=%02x xy=%u,%u res=%u,%u irq=%#x\n",
++	    fe, fi[0], fi[1], fi[2], fi[3],
++	    ((unsigned)fi[4] << 8) | fi[5], ((unsigned)fi[6] << 8) | fi[7], st.irq_status);
++	if (!fe && (uint8_t)(fi[0] + fi[1]) == 0xffu) {
++		unsigned rx = ((unsigned)fi[4] << 8) | fi[5];
++		unsigned ry = ((unsigned)fi[6] << 8) | fi[7];
++		if (rx >= 240 && rx <= 4096 && ry >= 240 && ry <= 4096) {
++			st.ax_max = (int)rx;
++			st.ay_max = (int)ry;
++		}
++		printf("SWEET NABU-TOUCH: firmware live, panel %dx%d\n", st.ax_max, st.ay_max);
++	} else {
++		printf("SWEET NABU-TOUCH: no valid fwinfo; will still poll (coords 1600x2560)\n");
++	}
++	unsigned errors = 0;
++	while (!st.dead) {
++		int err = nt_poll();
++		if (err) {
++			if ((errors++ % 200u) == 0) {
++				printf("SWEET NABU-TOUCH: poll err=%d irq=%#x\n", err, st.irq_status);
++			}
++			if (errors == 20) {
++				nt_report(0, st.x, st.y);   /* release on persistent failure */
++			}
++		} else {
++			errors = 0;
++		}
++		nt_wait(10);
++	}
++	nt_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++nabu_touch_init(void)
++{
++	int enabled = 0;            /* default off: only nabu sets nabutouch=1 */
++	int div = 8;                /* 19.2 MHz / 8 = 2.4 MHz SCK (register-safe) */
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("nabutouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	(void)PE_parse_boot_argn("nabutouchdiv", &div, sizeof(div));
++	st.clk_div = (div >= 1 && div <= 255) ? (unsigned)div : 8u;
++	kern_return_t kr = kernel_thread_start(nt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET NABU-TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
