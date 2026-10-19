@@ -1,0 +1,22 @@
+--- a/bsd/sweet_hfs/core/hfs_hotfiles.c
++++ b/bsd/sweet_hfs/core/hfs_hotfiles.c
+@@ -1389,6 +1389,19 @@
+ 	int filecount = 0;
+ 	int uncacheable = 0;
+
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: never record hot files. hfs_recording_init() creates the
++	 * hotfile B-tree, adding a file to the catalog during mount; on the
++	 * macOS-built HFSX root that catalog write corrupts an index node
++	 * (hfs_swap_HFSPlusBTInternalNode keyLength mismatch, fileID 4) and the
++	 * polled UFS then deadlocks at the boot-task mount, so SpringBoard never
++	 * launches. Disable hotfiles exactly as for a non-root volume.
++	 */
++	hfsmp->hfc_stage = HFC_DISABLED;
++	return (EPERM);
++#endif
++
+ 	/*
+ 	 * For now, only the boot volume is supported.
+ 	 */
