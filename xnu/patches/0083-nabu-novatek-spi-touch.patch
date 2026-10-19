@@ -23,7 +23,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,895 @@
+@@ -0,0 +1,1081 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
@@ -65,6 +65,7 @@
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +/* Mach MIG declaration is not included by BSD's exported thread.h. */
@@ -176,6 +177,21 @@
 +#define NVT_RD(a)        ((uint8_t)((a) & 0x7fu))
 +#define NVT_WR(a)        ((uint8_t)((a) | 0x80u))
 +#define NVT_DUMMY        1u
++/* NT36523 firmware download registers */
++#define NT_SWRST_N8_ADDR        0x03F0FEu
++#define NT_SPI_RD_FAST_ADDR     0x03F310u
++#define NT_TX_AUTO_COPY_EN      0x3F7E8u
++#define NT_SPI_DMA_TX_INFO      0x3F7F1u
++#define NT_BOOT_RDY_ADDR        0x3F10Du
++#define NT_BLD_CRC_EN_ADDR      0x3F30Eu
++#define NT_ILM_DES_ADDR         0x3F128u
++#define NT_ILM_LENGTH_ADDR      0x3F118u
++#define NT_G_ILM_CHECKSUM_ADDR  0x3F100u
++#define NT_DLM_DES_ADDR         0x3F12Cu
++#define NT_DLM_LENGTH_ADDR      0x3F130u
++#define NT_G_DLM_CHECKSUM_ADDR  0x3F104u
++#define NT_RESET_COMP_OFF       0x60u
++#define NT_HOST_CMD_OFF         0x50u
 +/* Logical maxima sweet_hid_touch() normalizes against (SweetHID /1080 /2400). */
 +#define NT_HID_X         1080
 +#define NT_HID_Y         2400
@@ -711,6 +727,154 @@
 +	return 0;
 +}
 +
++static inline uint32_t
++nt_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static int
++nt_write_buf(uint32_t addr, const uint8_t *data, unsigned len)
++{
++	int err = nt_set_page(addr);
++	if (err) {
++		return err;
++	}
++	uint8_t tx[130];
++	if (len + 1u > sizeof(tx)) {
++		return EINVAL;
++	}
++	tx[0] = NVT_WR(addr & 0x7fu);
++	memcpy(tx + 1, data, len);
++	return nt_xfer(tx, NULL, len + 1u);
++}
++
++static int
++nt_write_addr(uint32_t addr, uint8_t val)
++{
++	return nt_write_buf(addr, &val, 1);
++}
++
++static int
++nt_write_sram(uint32_t sram_addr, const uint8_t *data, unsigned size)
++{
++	unsigned off = 0;
++	while (off < size) {
++		uint32_t cur = sram_addr + off;
++		unsigned page_off = cur & 0x7fu;
++		unsigned chunk = 128u - page_off;
++		if (chunk > (size - off)) {
++			chunk = size - off;
++		}
++		int err = nt_write_buf(cur, data + off, chunk);
++		if (err) {
++			return err;
++		}
++		off += chunk;
++	}
++	return 0;
++}
++
++static bool
++nt_download_firmware(const uint8_t *fw, unsigned fw_size)
++{
++	if (fw_size < 0x22000) {
++		printf("SWEET NABU-TOUCH: fw size %u too small\n", fw_size);
++		return false;
++	}
++	uint32_t ilm_bin = nt_le32(fw + 0);
++	uint32_t ilm_sram = nt_le32(fw + 4);
++	uint32_t ilm_size = nt_le32(fw + 8);
++	uint32_t ilm_crc = nt_le32(fw + 0x18);
++
++	uint32_t dlm_bin = nt_le32(fw + 12);
++	uint32_t dlm_sram = nt_le32(fw + 16);
++	uint32_t dlm_size = nt_le32(fw + 20);
++	uint32_t dlm_crc = nt_le32(fw + 0x1c);
++
++	if ((ilm_bin + ilm_size) > fw_size || (dlm_bin + dlm_size) > fw_size) {
++		printf("SWEET NABU-TOUCH: invalid fw offsets\n");
++		return false;
++	}
++
++	printf("SWEET NABU-TOUCH: downloading touch firmware (%u bytes, ILM=%u DLM=%u)...\n",
++	    fw_size, ilm_size + 1u, dlm_size + 1u);
++
++	/* 1. Bootloader reset */
++	nt_write_addr(NT_SWRST_N8_ADDR, 0x69);
++	nt_wait(5);
++	nt_write_addr(NT_SPI_RD_FAST_ADDR, 0x00);
++
++	/* 2. Configure BLD HW CRC bank for ILM and DLM */
++	uint8_t d_ilm[3] = { (uint8_t)(ilm_sram & 0xff), (uint8_t)((ilm_sram >> 8) & 0xff), (uint8_t)((ilm_sram >> 16) & 0xff) };
++	nt_write_buf(NT_ILM_DES_ADDR, d_ilm, sizeof(d_ilm));
++	uint8_t l_ilm[3] = { (uint8_t)(ilm_size & 0xff), (uint8_t)((ilm_size >> 8) & 0xff), (uint8_t)((ilm_size >> 16) & 0x01) };
++	nt_write_buf(NT_ILM_LENGTH_ADDR, l_ilm, sizeof(l_ilm));
++	uint8_t c_ilm[4] = { (uint8_t)(ilm_crc & 0xff), (uint8_t)((ilm_crc >> 8) & 0xff), (uint8_t)((ilm_crc >> 16) & 0xff), (uint8_t)((ilm_crc >> 24) & 0xff) };
++	nt_write_buf(NT_G_ILM_CHECKSUM_ADDR, c_ilm, sizeof(c_ilm));
++
++	uint8_t d_dlm[3] = { (uint8_t)(dlm_sram & 0xff), (uint8_t)((dlm_sram >> 8) & 0xff), (uint8_t)((dlm_sram >> 16) & 0xff) };
++	nt_write_buf(NT_DLM_DES_ADDR, d_dlm, sizeof(d_dlm));
++	uint8_t l_dlm[3] = { (uint8_t)(dlm_size & 0xff), (uint8_t)((dlm_size >> 8) & 0xff), (uint8_t)((dlm_size >> 16) & 0x01) };
++	nt_write_buf(NT_DLM_LENGTH_ADDR, l_dlm, sizeof(l_dlm));
++	uint8_t c_dlm[4] = { (uint8_t)(dlm_crc & 0xff), (uint8_t)((dlm_crc >> 8) & 0xff), (uint8_t)((dlm_crc >> 16) & 0xff), (uint8_t)((dlm_crc >> 24) & 0xff) };
++	nt_write_buf(NT_G_DLM_CHECKSUM_ADDR, c_dlm, sizeof(c_dlm));
++
++	/* 3. Enable Cascade TX Auto Copy Mode */
++	nt_write_addr(NT_TX_AUTO_COPY_EN, 0x69);
++
++	/* 4. Write firmware sections: ILM, DLM, and cascade header */
++	if (nt_write_sram(ilm_sram, fw + ilm_bin, ilm_size + 1u)) {
++		printf("SWEET NABU-TOUCH: ILM write failed\n");
++		return false;
++	}
++	if (nt_write_sram(dlm_sram, fw + dlm_bin, dlm_size + 1u)) {
++		printf("SWEET NABU-TOUCH: DLM write failed\n");
++		return false;
++	}
++	if (nt_write_sram(0x0002c178u, fw, 256u)) {
++		printf("SWEET NABU-TOUCH: Header write failed\n");
++		return false;
++	}
++
++	/* 5. Poll SPI_DMA_TX_INFO */
++	uint8_t dma_info[1] = { 0xff };
++	for (unsigned i = 0; i < 200; ++i) {
++		if (!nt_read(NT_SPI_DMA_TX_INFO, NT_SPI_DMA_TX_INFO & 0x7fu, dma_info, 1) && dma_info[0] == 0) {
++			break;
++		}
++		nt_wait(1);
++	}
++
++	/* 6. Enable HW BLD CRC */
++	uint8_t bld_crc[1] = { 0 };
++	(void)nt_read(NT_BLD_CRC_EN_ADDR, NT_BLD_CRC_EN_ADDR & 0x7fu, bld_crc, 1);
++	nt_write_addr(NT_BLD_CRC_EN_ADDR, bld_crc[0] | 0x80u);
++
++	/* 7. Clear reset status & enable FW CRC */
++	nt_write_addr(NVT_EVENT_BUF | NT_RESET_COMP_OFF, 0x00);
++	nt_write_addr(NVT_EVENT_BUF | NT_HOST_CMD_OFF, 0xAE);
++
++	/* 8. Boot ready */
++	nt_write_addr(NT_BOOT_RDY_ADDR, 0x01);
++
++	/* 9. Wait for chip to boot into NORMAL_RUN (0xA3) */
++	uint8_t st_buf[6] = { 0 };
++	for (unsigned i = 0; i < 100; ++i) {
++		nt_wait(10);
++		if (!nt_read(NVT_EVENT_BUF, NT_RESET_COMP_OFF, st_buf, sizeof(st_buf))) {
++			if (st_buf[0] >= 0xA0u && st_buf[0] <= 0xA5u) {
++				printf("SWEET NABU-TOUCH: reset state 0x%02x after %u ms\n",
++				    st_buf[0], (i + 1) * 10);
++				return true;
++			}
++		}
++	}
++	printf("SWEET NABU-TOUCH: timed out waiting for reset state (last=0x%02x)\n", st_buf[0]);
++	return false;
++}
++
 +static void
 +nt_report(uint32_t mask, const int *x, const int *y)
 +{
@@ -850,9 +1014,31 @@
 +	printf("SWEET NABU-TOUCH: chip trim err=%d [%02x %02x %02x %02x %02x %02x]\n",
 +	    te, trim[0], trim[1], trim[2], trim[3], trim[4], trim[5]);
 +	uint8_t rst_state[6] = { 0 };
-+	int re = nt_read(0x2fe00u, 0x60u, rst_state, sizeof(rst_state));
++	int re = nt_read(NVT_EVENT_BUF, NT_RESET_COMP_OFF, rst_state, sizeof(rst_state));
 +	printf("SWEET NABU-TOUCH: rst_state err=%d [%02x %02x %02x %02x %02x %02x] (want 0xA3)\n",
 +	    re, rst_state[0], rst_state[1], rst_state[2], rst_state[3], rst_state[4], rst_state[5]);
++
++	const uint8_t *touch_fw = NULL;
++	unsigned int touch_fw_size = 0;
++	DTEntry chosen_node;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen_node) == kSuccess) {
++		if (SecureDTGetProperty(chosen_node, "touch-firmware", (void const **)&touch_fw, &touch_fw_size) == kSuccess && touch_fw_size > 0) {
++			printf("SWEET NABU-TOUCH: found touch-firmware in ADT (%u bytes)\n", touch_fw_size);
++		}
++	}
++
++	if (rst_state[0] != 0xA3u) {
++		if (touch_fw && touch_fw_size >= 0x22000) {
++			if (nt_download_firmware(touch_fw, touch_fw_size)) {
++				nt_wait(20);
++				(void)nt_read(NVT_EVENT_BUF, NT_RESET_COMP_OFF, rst_state, sizeof(rst_state));
++				printf("SWEET NABU-TOUCH: after fw load rst_state [%02x %02x %02x %02x %02x %02x]\n",
++				    rst_state[0], rst_state[1], rst_state[2], rst_state[3], rst_state[4], rst_state[5]);
++			}
++		} else {
++			printf("SWEET NABU-TOUCH: rst_state != 0xA3 and no touch-firmware in ADT!\n");
++		}
++	}
 +	uint8_t fi[17] = { 0 };
 +	int fe = nt_read(NVT_EVENT_BUF, NVT_FWINFO_OFF, fi, sizeof(fi));
 +	printf("SWEET NABU-TOUCH: fwinfo err=%d ver=%02x inv=%02x xy=%u,%u res=%u,%u irq=%#x\n",
