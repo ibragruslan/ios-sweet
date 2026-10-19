@@ -2,47 +2,37 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-19 (nabu TOUCH driver written — patch 0083, read first) <<<
+### >>> UPDATE 2026-10-19 (nabu TOUCH driver: SE18 fix — patch 0083 updated) <<<
 
 Milestone before this: **full-screen iOS 16 GUI renders on nabu** (SpringBoard,
 patch 0082 scales the iPhone-X 1125x2436 logical frame onto the 1600x2560 panel;
 user confirmed "РАБОТАЕТ!"). Wallpaper is still black (PosterBoard has no seeded
 default poster) but icons render and the home screen is there. Next: **touch**.
 
-**What I wrote (not yet CI-built or tested):** `xnu/patches/0083-nabu-novatek-spi-touch.patch`
-creates `bsd/dev/nabu_touch.c`, a Novatek **NT36523** driver on **GENI SPI SE19**
-(nabu's panel), and wires `nabu_touch_init()` into `sweet_ufs.c` next to
-`sweet_touch_init()`. It is SEPARATE from `sweet_touch.c` (Goodix/FTS *I2C* on
-SE7, which is sweet-only) so sweet is untouched. Gated by boot-arg **`nabutouch=1`**
-(default off); on nabu also pass **`sweettouch=0`** so the SE7 I2C probe doesn't run.
-
-Hardware facts it is built on (all verified from Linux v6.6 + the MiCode nabu
-vendor kernel, not guessed):
-- SE19 = QUPv3 **wrap2 S2**. Clk branch vote `GCC 0x52014` (s-clk BIT6, m-ahb
-  BIT2, s-ahb BIT1); RCG `0x1e3a8` set to XO (19.2 MHz); SE base `0xc88000`.
-- Pins **gpio55-58** = SOUTH TLMM tile (**base 0x03d00000**, ctl = pin*0x1000),
-  func **qup19 = mux 2**; ctl field layout identical to sweet's `touch_gpio`.
-- GENI SPI: proto=1, mode-0 (CPOL=0/CPHA=0), word_len=4 (8-bit), MSB-first
-  packing CFG0=`0x7f8fe`/CFG1=`0xffefe` (computed from geni_se_config_packing),
-  CS via CS_ASSERT(8)/CS_DEASSERT(9) M_CMDs, data opcode TX(1)|RX(2) +
-  FRAGMENTATION, opcode<<27. SCK = 19.2MHz / `nabutouchdiv` (default 8 = 2.4MHz).
-- NT36523: EVENT_BUF_ADDR `0x2FE00`, read=clear bit7 / write=set bit7, 1 dummy
-  byte, parse 6 bytes/finger (id=p[0]>>3, down if p[0]&7 in {1,2},
-  x=(p[1]<<4)|(p[3]>>4), y=(p[2]<<4)|(p[3]&0xf)), panel 1600x2560.
-- `sweet_hid_touch(finger,down,x,y)` (SweetHID) normalizes x/1080, y/2400, so the
-  driver scales Novatek 1600x2560 down to 1080x2400 before calling it.
-
-**KEY FINDING (first boot of 0083, 2026-10-19):** the driver ran and read SE19:
-`se fw=0x303 proto=3 (1=SPI)` — ABL leaves SE19 running the **GENI I2C**
-firmware, not SPI. A GENI serial engine is a programmable state machine; its
-protocol is set by firmware loaded into its config RAM. 0xc88000 = qup19, and
-the nabu touch is 100% SPI (MiCode driver = `spi_register_driver`, compatible
-`novatek,NVT-ts-spi`, `spi-max-frequency` 9.6 MHz; the SE can be i2c19 OR spi19
-at the same address). So we must load the GENI **SPI** SE firmware into SE19
-before any SPI, exactly as the Android kernel does at probe. (This is the GENI
-SE firmware — the SoC serial engine — NOT the NT36523 controller firmware; the
-192 KB `novatek_nt36523_fw.bin` in ZenOS/boards/firmware is the latter, needed
-only later if the chip itself needs a host FW download.)
+**CRITICAL FINDING (second boot of 0083):**
+1. Firmware loading works! Log showed:
+   `SWEET NABU-TOUCH: SE19 proto=3, loading GENI SPI firmware`
+   `SWEET NABU-TOUCH: after load fw=0x100 proto=1 (want 1)`
+   So XPU does NOT protect GENI config RAM; direct writes succeed and SE becomes SPI!
+2. BUT fwinfo returned all `0xFF` (`ver=ff inv=ff res=65535,65535`).
+   Investigation of the actual nabu DTB (`dtb/boot_unpacked/dtb`) revealed:
+   - **Novatek NT36523 is on SE18 (0x00c84000), NOT SE19 (0x00c88000)!**
+     `qupv3_se18_spi: spi@c84000` has child `novatek@0 { compatible = "novatek,NVT-ts-spi" }`.
+     `qupv3_se19_spi: spi@c88000` is disabled and disconnected on nabu.
+   - **SPI Pins:** gpio23 (MOSI mux 2), gpio24 (MISO mux 3), gpio25 (CLK mux 3), gpio26 (CS mux 2)
+     on the **EAST TLMM tile (0x03500000)**.
+   - **Reset Pin:** gpio12 on the **NORTH TLMM tile (0x03900000)**, active-low.
+   - **IRQ Pin:** gpio39 on the **NORTH TLMM tile (0x03900000)**.
+   - **Active Rail:** gpio122 on the **SOUTH TLMM tile (0x03d00000)** (pulled high).
+   - **Clocks for SE18:** RCG `0x1e278` (`qupv3_wrap2_s1_clk_src`), vote `0x52014` bit 5
+     (mask `(1<<5) | (1<<2) | (1<<1)` = `0x26`).
+3. Patch 0083 updated:
+   - SE base set to `0x00c84000` (SE18)
+   - Clock vote and RCG updated for s1
+   - Maps EAST (`0x03500000`), NORTH (`0x03900000`), SOUTH (`0x03d00000`) tiles
+   - Pins 23-26 muxed to `qup18`
+   - Pin 12 (Reset) pulsed LOW (10ms) then HIGH (20ms) to take NT36523 out of reset
+   - Adds chip trim read (`0x3f004`) to confirm chip ID alongside FWINFO (`0x2fe78`)
 
 **Driver strategy (0083, now with firmware load):** on start (boot-arg
 `nabutouchdelay`, default 45 s) it votes the wrap2 SE clock, and if SE19's

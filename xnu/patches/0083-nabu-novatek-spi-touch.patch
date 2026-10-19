@@ -23,12 +23,12 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,868 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
 + * Separate from sweet_touch.c (Goodix/FTS *I2C* on SE7): nabu's panel is a
-+ * Novatek NT36523 on QUPv3 wrapper-2 SE2 (= "qup19", SPI) at 0x00c88000.
++ * Novatek NT36523 on QUPv3 wrapper-2 SE1 (= "qup18", SPI) at 0x00c84000.
 + * Enabled by boot-arg nabutouch=1 (default off); on nabu also pass
 + * sweettouch=0 so the SE7 I2C probe does not run.
 + *
@@ -72,16 +72,16 @@
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void nabu_touch_init(void);
 +
-+/* GCC (shared with sweet): QUPv3 wrapper-2 SE2 = SE19. */
++/* GCC (shared with sweet): QUPv3 wrapper-2 SE1 = SE18. */
 +#define NT_GCC_PA        0x00100000u
 +#define NT_GCC_VOTE      0x52014u
-+#define NT_VOTE_MASK     ((1u << 6) | (1u << 2) | (1u << 1)) /* s2, m-ahb, s-ahb */
-+#define NT_RCG           0x1e3a8u            /* wrap2_s2 clk CMD_RCGR */
-+/* TLMM SOUTH tile (SM8150): per-pin ctl = base + pin*0x1000, io = +4. */
-+#define NT_TLMM_PA       0x03d00000u
-+#define NT_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
-+#define NT_GPIO_IO(n)    (NT_GPIO_CFG(n) + 4u)
-+#define NT_SE_PA         0x00c88000u
++#define NT_VOTE_MASK     ((1u << 5) | (1u << 2) | (1u << 1)) /* s1, m-ahb, s-ahb */
++#define NT_RCG           0x1e278u            /* wrap2_s1 clk CMD_RCGR */
++/* TLMM tiles (SM8150): EAST (qup18 pins 23-26), NORTH (rst 12, irq 39), SOUTH (122) */
++#define NT_TLMM_EAST_PA  0x03500000u
++#define NT_TLMM_NORTH_PA 0x03900000u
++#define NT_TLMM_SOUTH_PA 0x03d00000u
++#define NT_SE_PA         0x00c84000u
 +/* geniqup@cc0000 wrapper (QUP_HW_VER + common CGC used by fw load). */
 +#define NT_WRAP_PA       0x00cc0000u
 +#define NT_QUP_HW_VER    0x004u
@@ -348,7 +348,7 @@
 +};
 +
 +static struct {
-+	vm_offset_t gcc, gpio, se, wrap;
++	vm_offset_t gcc, tlmm_east, tlmm_north, tlmm_south, se, wrap;
 +	bool started, dead;
 +	unsigned clk_div, tx_depth, rx_depth;
 +	int ax_max, ay_max;
@@ -406,15 +406,28 @@
 +	return false;
 +}
 +
-+/* TLMM: identical field layout to sweet (mux<<2 | pull | drive<<6 | oe<<9). */
++/* TLMM: cfg=(mux<<2 | pull | drive<<6 | oe<<9), io=(out<<1 | in<<0). */
 +static void
-+nt_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive)
++nt_gpio(vm_offset_t tile, unsigned pin, unsigned mux, unsigned pull, unsigned drive, unsigned oe)
 +{
-+	uint32_t off = NT_GPIO_CFG(pin);
-+	uint32_t cfg = nt_rd(st.gpio, off);
++	uint32_t off = (uint32_t)pin * 0x1000u;
++	uint32_t cfg = nt_rd(tile, off);
 +	cfg &= ~0x3ffu;
-+	cfg |= (mux << 2) | pull | (drive << 6);
-+	nt_wr(st.gpio, off, cfg);
++	cfg |= (mux << 2) | pull | (drive << 6) | (oe << 9);
++	nt_wr(tile, off, cfg);
++}
++
++static void
++nt_gpio_set(vm_offset_t tile, unsigned pin, unsigned val)
++{
++	uint32_t off = (uint32_t)pin * 0x1000u + 4u;
++	uint32_t io = nt_rd(tile, off);
++	if (val) {
++		io |= (1u << 1);
++	} else {
++		io &= ~(1u << 1);
++	}
++	nt_wr(tile, off, io);
 +}
 +
 +static bool
@@ -502,7 +515,7 @@
 +	printf("SWEET NABU-TOUCH: se fw=%#x proto=%u (1=SPI) status=%#x tx_depth=%u rx_depth=%u\n",
 +	    fw, proto, nt_rd(st.se, G_STATUS), st.tx_depth, st.rx_depth);
 +	if (proto != 1u) {
-+		printf("SWEET NABU-TOUCH: SE19 not SPI after fw load; stop\n");
++		printf("SWEET NABU-TOUCH: SE18 not SPI after fw load; stop\n");
 +		return false;
 +	}
 +	nt_wr(st.se, G_GSI_EVENT_EN, 0);
@@ -760,13 +773,32 @@
 +	printf("SWEET NABU-TOUCH: starting in %u s (clk_div=%u)\n", delay_s, st.clk_div);
 +	nt_wait(delay_s * 1000u);
 +	st.gcc = ml_io_map(NT_GCC_PA, 0x60000);
-+	st.gpio = ml_io_map(NT_TLMM_PA, 0x40000);
++	st.tlmm_east = ml_io_map(NT_TLMM_EAST_PA, 0x40000);
++	st.tlmm_north = ml_io_map(NT_TLMM_NORTH_PA, 0x40000);
++	st.tlmm_south = ml_io_map(NT_TLMM_SOUTH_PA, 0x80000);
 +	st.se = ml_io_map(NT_SE_PA, 0x4000);
 +	st.wrap = ml_io_map(NT_WRAP_PA, 0x1000);
-+	if (!st.gcc || !st.gpio || !st.se || !st.wrap) {
++	if (!st.gcc || !st.tlmm_east || !st.tlmm_north || !st.tlmm_south || !st.se || !st.wrap) {
 +		printf("SWEET NABU-TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
++	/* Configure GPIOs first */
++	/* gpio23-26 -> qup18 on EAST tile (MOSI 23 mux 2, MISO 24 mux 3, CLK 25 mux 3, CS_N 26 mux 2) */
++	nt_gpio(st.tlmm_east, 23, 2, 0, 2, 0);
++	nt_gpio(st.tlmm_east, 24, 3, 0, 2, 0);
++	nt_gpio(st.tlmm_east, 25, 3, 0, 2, 0);
++	nt_gpio(st.tlmm_east, 26, 2, 0, 2, 0);
++	/* gpio122 -> pull-up / active rail on SOUTH tile */
++	nt_gpio(st.tlmm_south, 122, 0, 3, 3, 1);
++	nt_gpio_set(st.tlmm_south, 122, 1);
++	/* gpio39 -> IRQ input on NORTH tile */
++	nt_gpio(st.tlmm_north, 39, 0, 1, 4, 0);
++	/* gpio12 -> RESET output on NORTH tile: pulse LOW for 10ms then release HIGH */
++	nt_gpio(st.tlmm_north, 12, 0, 0, 1, 1);
++	nt_gpio_set(st.tlmm_north, 12, 0);
++	nt_wait(10);
++	nt_gpio_set(st.tlmm_north, 12, 1);
++	nt_wait(20);
 +	if (!nt_clocks()) {
 +		goto out;
 +	}
@@ -783,7 +815,7 @@
 +	/* If ABL left the I2C firmware (proto!=1), load the SPI SE firmware. */
 +	uint32_t proto = (nt_rd(st.se, G_FW_REV) >> 8) & 0xffu;
 +	if (proto != 1u) {
-+		printf("SWEET NABU-TOUCH: SE19 proto=%u, loading GENI SPI firmware\n", proto);
++		printf("SWEET NABU-TOUCH: SE18 proto=%u, loading GENI SPI firmware\n", proto);
 +		if (!nt_load_fw()) {
 +			printf("SWEET NABU-TOUCH: SPI firmware load failed; stop\n");
 +			goto out;
@@ -792,14 +824,13 @@
 +	if (!nt_se_init()) {
 +		goto out;
 +	}
-+	/* gpio55-58 -> qup19 (mux 2), 6 mA, no internal pull. */
-+	nt_gpio(55, 2, 0, 2);
-+	nt_gpio(56, 2, 0, 2);
-+	nt_gpio(57, 2, 0, 2);
-+	nt_gpio(58, 2, 0, 2);
 +	nt_wait(20);
 +	st.ax_max = 1600;
 +	st.ay_max = 2560;
++	uint8_t trim[6] = { 0 };
++	int te = nt_read(0x3f004u, 0x3f004u & 0x7fu, trim, sizeof(trim));
++	printf("SWEET NABU-TOUCH: chip trim err=%d [%02x %02x %02x %02x %02x %02x]\n",
++	    te, trim[0], trim[1], trim[2], trim[3], trim[4], trim[5]);
 +	uint8_t fi[17] = { 0 };
 +	int fe = nt_read(NVT_EVENT_BUF, NVT_FWINFO_OFF, fi, sizeof(fi));
 +	printf("SWEET NABU-TOUCH: fwinfo err=%d ver=%02x inv=%02x xy=%u,%u res=%u,%u irq=%#x\n",
