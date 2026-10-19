@@ -5,13 +5,17 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
 -#define SWEET_FB_DOT_PITCH              395     /* ppi, 6.67" 1080x2400 */
-+#define SWEET_FB_DOT_PITCH              275     /* ppi, Xiaomi Pad 5 1600x2560 */
++#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
 +/*
-+ * Presentation geometry for Xiaomi Pad 5 (nabu).
-+ * Native panel resolution is 1600x2560.
++ * The iOS userland only has status bar / layout data for real iPhone
++ * screens (UIKit: "No status bar visual provider for screen", the red
++ * rdar://45025538 bar for 360x800 points). The display is therefore
++ * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
++ * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * Boot-arg sweetfb_native=1 presents the real panel size instead.
 + */
-+#define SWEET_FB_LOGICAL_W              1600
-+#define SWEET_FB_LOGICAL_H              2560
++#define SWEET_FB_LOGICAL_W              1125
++#define SWEET_FB_LOGICAL_H              2436
  #define SWEET_FB_FORMAT_BGRA            0x42475241
  
  class IOMobileFramebuffer : public IOService {
@@ -99,10 +103,10 @@
  	}
 +	int native = 0;
 +	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
-+	fLogicalW = native ? 1600 : 1600;
-+	fLogicalH = native ? 2560 : 2560;
-+	fOffX = (fLogicalW - 1600) / 2;
-+	fOffY = (fLogicalH - 2560) / 2;
++	fLogicalW = native ? 1080 : 1125;
++	fLogicalH = native ? 2400 : 2436;
++	fOffX = (fLogicalW - 1080) / 2;
++	fOffY = (fLogicalH - 2400) / 2;
  	/* The digitizer covers the main display (backboardd maps it 1:1). */
  	setProperty("DisplayIntegrated", kOSBooleanTrue);
  	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
@@ -112,7 +116,7 @@
  	bool was = fDown[finger];
 -	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
 -	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2400);
-+	/* Panel pixels -> the presented display coordinates. */
++	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
 +	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
 +	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
  	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
