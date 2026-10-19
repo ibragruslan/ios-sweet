@@ -32,7 +32,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,205 @@
 +/*
 + * Minimal polled SWEET keys. Call once after the scheduler is running.
 + * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
@@ -139,11 +139,11 @@
 +		uint8_t pon = 0, gpio = 0;
 +		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
 +		bool gok = (keys_gpio_apid != KEYS_NO_APID) && keys_read(keys_gpio_apid, keys_gpio_reg, &gpio);
-+		int now[3] = {
-+			pok ? !!(pon & 1u) : state[0],
-+			gok ? !(gpio & 1u) : state[1],
-+			pok ? !!(pon & 2u) : state[2]
-+		};
++		int now[3];
++		int k;
++		now[0] = pok ? !!(pon & 1u) : state[0];
++		now[1] = gok ? !(gpio & 1u) : state[1];
++		now[2] = pok ? !!(pon & 2u) : state[2];
 +		if (!pok || (!gok && keys_gpio_apid != KEYS_NO_APID)) {
 +			if ((errors++ % 250u) == 0) {
 +				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
@@ -154,7 +154,7 @@
 +		}
 +
 +		if (!inited) {
-+			for (int k = 0; k < 3; ++k) {
++			for (k = 0; k < 3; ++k) {
 +				state[k] = now[k];
 +				last_raw[k] = now[k];
 +			}
@@ -162,7 +162,7 @@
 +			printf("SWEET KEYS: ready, boot state power=%d vol_up=%d vol_down=%d\n",
 +			    state[0], state[1], state[2]);
 +		} else {
-+			for (int k = 0; k < 3; ++k) {
++			for (k = 0; k < 3; ++k) {
 +				bool valid = (k == 1) ? gok : pok;
 +				if (valid && now[k] == last_raw[k] && now[k] != state[k]) {
 +					state[k] = now[k];
@@ -181,6 +181,12 @@
 +{
 +	int enabled = 1;
 +	thread_t thread;
++	uint32_t count;
++	uint16_t nabu_gpio6;
++	uint8_t pon = 0, gpio = 0;
++	bool pok, gok;
++	kern_return_t kr;
++
 +	if (keys_started) {
 +		return;
 +	}
@@ -198,7 +204,7 @@
 +		return;
 +	}
 +	keys_version = keys_rd(keys_core, 0);
-+	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
++	count = keys_rd(keys_core, 4) & 0x7ffu;
 +	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
 +	    count == 0 || count > 512) {
 +		printf("SWEET KEYS: unsupported arbiter version=%#x apids=%u\n",
@@ -206,7 +212,7 @@
 +		return;
 +	}
 +	keys_pon_apid = keys_find_apid(0x008, count);
-+	uint16_t nabu_gpio6 = keys_find_apid(0x0c5, count);
++	nabu_gpio6 = keys_find_apid(0x0c5, count);
 +	if (nabu_gpio6 != KEYS_NO_APID) {
 +		keys_gpio_apid = nabu_gpio6;
 +		keys_gpio_reg = 0xc508u;
@@ -216,16 +222,15 @@
 +		keys_gpio_reg = KEYS_GPIO_RT;
 +		printf("SWEET KEYS: using Sweet PM6150L GPIO1 (apid=%u reg=%#x)\n", keys_gpio_apid, keys_gpio_reg);
 +	}
-+	uint8_t pon = 0, gpio = 0;
-+	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
-+	bool gok = (keys_gpio_apid != KEYS_NO_APID) && keys_read(keys_gpio_apid, keys_gpio_reg, &gpio);
++	pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++	gok = (keys_gpio_apid != KEYS_NO_APID) && keys_read(keys_gpio_apid, keys_gpio_reg, &gpio);
 +	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-apid=%u (pon=%#x/%d gpio=%#x/%d)\n",
 +	    keys_version, count, keys_pon_apid, keys_gpio_apid,
 +	    pon, pok, gpio, gok);
 +	if (!pok && !gok) {
 +		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
 +	}
-+	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
++	kr = kernel_thread_start(keys_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
