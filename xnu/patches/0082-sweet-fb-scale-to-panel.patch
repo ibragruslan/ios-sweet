@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -168,14 +168,18 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = fWidth;
+-	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
+-	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * Present the iPhone X logical display (SWEET_FB_LOGICAL) and SCALE it to
++	 * fill the whole panel (fWidth x fHeight) in swap(): backboardd then gets a
++	 * valid iOS screen class (no AppleM2ScalerCSCDriver match loop) AND the UI
++	 * covers the entire panel, even when the panel is far larger than any
++	 * iPhone (e.g. the 1600x2560 Xiaomi Pad 5). sweetfb_native=1 keeps the raw
++	 * panel geometry with no scaling.
++	 */
++	fLogicalW = native ? fWidth : SWEET_FB_LOGICAL_W;
++	fLogicalH = native ? fHeight : SWEET_FB_LOGICAL_H;
++	fOffX = 0;
++	fOffY = 0;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -390,11 +394,33 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++		if (src != 0 && bpe == 4 && w > 0 && h > 0) {
++			/*
++			 * Nearest-neighbour scale the logical dest rect (w x h, in the
++			 * presented 1125x2436 space) onto its panel rectangle so the frame
++			 * fills the whole physical panel. 1:1 when fLogical == panel.
++			 */
++			int32_t pdx = dx * (int32_t)fWidth  / (int32_t)fLogicalW;
++			int32_t pdy = dy * (int32_t)fHeight / (int32_t)fLogicalH;
++			int32_t pw  = w  * (int32_t)fWidth  / (int32_t)fLogicalW;
++			int32_t ph  = h  * (int32_t)fHeight / (int32_t)fLogicalH;
++			if (pdx < 0) { pdx = 0; }
++			if (pdy < 0) { pdy = 0; }
++			if (pw > (int32_t)fWidth  - pdx) { pw = (int32_t)fWidth  - pdx; }
++			if (ph > (int32_t)fHeight - pdy) { ph = (int32_t)fHeight - pdy; }
++			uint32_t xstep = pw > 0 ? (((uint32_t)w << 16) / (uint32_t)pw) : 0;
++			uint32_t ystep = ph > 0 ? (((uint32_t)h << 16) / (uint32_t)ph) : 0;
++			for (int32_t py = 0; py < ph; py++) {
++				uint32_t srow = (uint32_t)sy + (((uint32_t)py * ystep) >> 16);
++				const uint32_t *sp = (const uint32_t *)(src + s->offset +
++				    (uint64_t)srow * s->bytesPerRow + (uint64_t)sx * 4);
++				uint32_t *dp = (uint32_t *)(fPixels + (uint64_t)(pdy + py) * fRowBytes +
++				    (uint64_t)pdx * 4);
++				uint32_t xacc = 0;
++				for (int32_t px = 0; px < pw; px++) {
++					dp[px] = sp[xacc >> 16];
++					xacc += xstep;
++				}
+ 			}
+ 		}
+ 		s->release();
