@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1164 @@
+@@ -0,0 +1,1169 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -457,6 +457,15 @@ index 0000000..7e770a0
 +	d->cbndx = target_cb;
 +	d->cb = base + 0x8000ULL + (uint64_t)target_cb * 0x1000ULL;
 +
++	/* GR1: CBAR & CBA2R */
++	wr32(base, 0x1000u + target_cb * 4, 0); /* CBARn: Stage 1 */
++	wr32(base, 0x1800u + target_cb * 4, 1); /* CBA2Rn: VA64 (AArch64 64-bit format) */
++
++	/* SMR & S2CR */
++	int n = target_cb;
++	wr32(base, 0xc00u + n * 4, (0u << 16) | (uint32_t)target_cb); /* S2CR: translation */
++	wr32(base, 0x800u + n * 4, (1u << 31) | (mask << 16) | sid);   /* SMR: valid */
++
 +	/* Disable & config CB */
 +	wr32(d->cb, 0x000u, 0); /* CB_SCTLR = 0 */
 +	wr32(d->cb, 0x004u, rd32(d->cb, 0x004u) & ~2u); /* ACTLR */
@@ -470,12 +479,7 @@ index 0000000..7e770a0
 +	wr32(d->cb, 0x058u, 0xffffffffu); /* clear FSR */
 +	wr32(d->cb, 0x618u, 0);            /* TLBIALL */
 +	wr32(d->cb, 0x7f0u, 0);            /* TLBSYNC */
-+	wr32(d->cb, 0x000u, 1u | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 12)); /* SCTLR enable */
-+
-+	/* SMR & S2CR */
-+	int n = target_cb;
-+	wr32(base, 0xc00u + n * 4, (0u << 16) | (uint32_t)target_cb); /* S2CR: translation */
-+	wr32(base, 0x800u + n * 4, (1u << 31) | (mask << 16) | sid);   /* SMR: valid */
++	wr32(d->cb, 0x000u, 0x21u);        /* SCTLR: M | CFRE */
 +	return 0;
 +}
 +
@@ -909,11 +913,11 @@ index 0000000..7e770a0
 +
 +	/* Map in GMU SMMU domain */
 +	s_gmu_smmu.base = s_smmu;
-+	smmu_map(&s_gmu_smmu, 0x60000000u, dummy_pa, 4096, 0);
-+	smmu_map(&s_gmu_smmu, 0x04000u, icache_pa, 240 * 1024, SMMU_PRIV);
-+	smmu_map(&s_gmu_smmu, 0x44000u, dcache_pa, 240 * 1024, SMMU_PRIV);
-+	smmu_map(&s_gmu_smmu, 0x60001000u, log_pa, 16384, 0);
-+	smmu_map(&s_gmu_smmu, 0x60005000u, hfi_pa, 16384, 0);
++	smmu_map(&s_gmu_smmu, 0x60000000u, dummy_pa, 4096, SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x04000u, icache_pa, 240 * 1024, SMMU_EXEC | SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x44000u, dcache_pa, 240 * 1024, SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x60001000u, log_pa, 16384, SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x60005000u, hfi_pa, 16384, SMMU_CACHED);
 +	smmu_attach(&s_gmu_smmu, GMU_SID, GMU_SID_MASK, 1);
 +
 +	/* Setup HFI queues */
@@ -959,9 +963,10 @@ index 0000000..7e770a0
 +	wr32(GMU_REG(GMU_CM3_SYSRESET), 0, 1);
 +	wr32(GMU_REG(GMU_PWR_COL_CP_RESP), 0, 0);
 +	wr32(GMU_REG(GMU_CM3_SYSRESET), 0, 0);
-+	if (poll_bit(GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, ok_val, 100)) {
-+		printf("SWEET NABU-GPU: GMU init timeout (ver=%#x res=%#x)\n",
-+		    ver, rd32(GMU_REG(GMU_CM3_FW_INIT_RESULT), 0));
++	if (poll_bit(GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, ok_val, 200)) {
++		printf("SWEET NABU-GPU: GMU init timeout (ver=%#x res=%#x fsr=%#x far=%#x)\n",
++		    ver, rd32(GMU_REG(GMU_CM3_FW_INIT_RESULT), 0),
++		    rd32(s_gmu_smmu.cb, 0x058), rd32(s_gmu_smmu.cb, 0x060));
 +		return -10;
 +	}
 +
@@ -1044,7 +1049,7 @@ index 0000000..7e770a0
 +	flush_gpu_cache((vm_offset_t)sqe_va, sqe_len - 4);
 +
 +	s_gpu_smmu.base = s_smmu;
-+	smmu_map(&s_gpu_smmu, sqe_pa, sqe_pa, 64 * 1024, SMMU_EXEC);
++	smmu_map(&s_gpu_smmu, sqe_pa, sqe_pa, 64 * 1024, SMMU_EXEC | SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, s_rb_pa, s_rb_pa, RB_BYTES, SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, s_scratch_pa, s_scratch_pa, 4096, SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, 0x9c000000ULL, 0x9c000000ULL, 16 * 1024 * 1024, SMMU_CACHED);
