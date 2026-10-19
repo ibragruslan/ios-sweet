@@ -23,7 +23,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,1111 @@
+@@ -0,0 +1,1115 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
@@ -843,7 +843,7 @@
 +	/* 3. Enable Cascade TX Auto Copy Mode */
 +	nt_write_addr(NT_TX_AUTO_COPY_EN, 0x69);
 +
-+	/* 4. Write firmware sections: ILM, DLM, and cascade header */
++	/* 4. Write firmware sections: ILM, DLM, and cascade headers */
 +	if (nt_write_sram(ilm_sram, fw + ilm_bin, ilm_size + 1u)) {
 +		printf("SWEET NABU-TOUCH: ILM write failed\n");
 +		return false;
@@ -854,11 +854,15 @@
 +		return false;
 +	}
 +	printf("SWEET NABU-TOUCH: DLM %u bytes OK\n", dlm_size + 1u);
-+	if (nt_write_sram(0x0002c178u, fw, 256u)) {
++
++	/* Write headers: both Header 1 (master) and Header 2 (cascade slave) */
++	uint32_t hdr_sram = dlm_sram + dlm_size + 1u;
++	uint32_t hdr_size = (fw_size >= 512) ? 512u : 256u;
++	if (nt_write_sram(hdr_sram, fw, hdr_size)) {
 +		printf("SWEET NABU-TOUCH: Header write failed\n");
 +		return false;
 +	}
-+	printf("SWEET NABU-TOUCH: Header 256 bytes OK\n");
++	printf("SWEET NABU-TOUCH: Headers at 0x%08x (%u bytes) OK\n", hdr_sram, hdr_size);
 +
 +	/* 5. Poll SPI_DMA_TX_INFO */
 +	uint8_t dma_info[1] = { 0xff };
@@ -887,7 +891,7 @@
 +	for (unsigned i = 0; i < 100; ++i) {
 +		nt_wait(10);
 +		if (!nt_read(NVT_EVENT_BUF, NT_RESET_COMP_OFF, st_buf, sizeof(st_buf))) {
-+			if (st_buf[0] >= 0xA0u && st_buf[0] <= 0xA5u) {
++			if ((st_buf[0] >= 0xA0u && st_buf[0] <= 0xAFu) || st_buf[0] == 0x9Fu) {
 +				printf("SWEET NABU-TOUCH: reset state 0x%02x after %u ms\n",
 +				    st_buf[0], (i + 1) * 10);
 +				return true;
