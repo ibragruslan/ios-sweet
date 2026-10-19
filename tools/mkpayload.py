@@ -149,7 +149,25 @@ def add_touch_fw_to_adt(adt_blob, fw_path):
     return adt.serialize(root)
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touch_fw_path=None):
+def add_gpu_fw_to_adt(adt_blob, fw_dir):
+    """Return the ADT with /chosen GPU firmware properties."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    files = {
+        'gmu-firmware': 'a640_gmu.bin',
+        'sqe-firmware': 'a630_sqe.fw',
+        'zap-mdt': 'a640_zap.mdt',
+        'zap-b02': 'a640_zap.b02',
+    }
+    for prop, name in files.items():
+        p = os.path.join(fw_dir, name)
+        if os.path.exists(p):
+            chosen.props.append((prop, 0, open(p, 'rb').read()))
+            print(f'injected {prop} ({os.path.getsize(p)} bytes) from {name}')
+    return adt.serialize(root)
+
+
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touch_fw_path=None, gpu_fw_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -179,6 +197,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touch_fw_path=None)
 
     if touch_fw_path:
         adt_blob = add_touch_fw_to_adt(adt_blob, touch_fw_path)
+
+    if gpu_fw_dir:
+        adt_blob = add_gpu_fw_to_adt(adt_blob, gpu_fw_dir)
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -211,8 +232,9 @@ if __name__ == '__main__':
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--touch-firmware', help='touch firmware blob to inject into /chosen in ADT')
+    ap.add_argument('--gpu-firmware-dir', help='directory containing a640_gmu.bin, a630_sqe.fw, a640_zap.mdt, a640_zap.b02 to inject into /chosen')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.touch_firmware)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.touch_firmware, a.gpu_firmware_dir)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

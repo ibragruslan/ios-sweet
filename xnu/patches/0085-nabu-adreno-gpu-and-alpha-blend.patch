@@ -1,0 +1,562 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,5 +112,6 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/nabu_touch.c			standard
+ bsd/dev/nabu_backlight.c		standard
++bsd/dev/nabu_adreno.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,5 +54,6 @@
+ extern void sweet_usb_probe(void);
+ extern void nabu_touch_init(void);
+ extern void nabu_backlight_init(void);
++extern void nabu_adreno_init(void);
+ 
+ #define REG_CAP         0x00
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	nabu_touch_init();
+ 	nabu_backlight_init();
++	nabu_adreno_init();
+ 	return 0;
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -62,8 +62,36 @@
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
+ };
+ 
+ extern "C" int nabu_backlight_set_power(int on);
++
++extern "C" int nabu_adreno_ready(void);
++extern "C" int nabu_adreno_blit(uint64_t src_pa, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
++                               uint32_t s_pitch, uint32_t s_width, uint32_t s_height,
++                               uint64_t dst_pa, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
++                               uint32_t d_pitch, uint32_t d_width, uint32_t d_height, uint32_t layer);
++
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
++		registerService();
++		return true;
++	}
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
++		setProperty("IOGLBundleName", "AppleMetal");
++		setProperty("IOGVACodec", "AppleMetal");
++		registerService();
++		return true;
++	}
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -194,5 +221,17 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	setProperty("backlight-control", kOSBooleanTrue);
+ 	registerService();
++
++	AppleM2ScalerCSCDriver *scaler = OSTypeAlloc(AppleM2ScalerCSCDriver);
++	if (scaler && scaler->init()) {
++		scaler->attach(this);
++		scaler->start(this);
++	}
++	IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
++	if (accel && accel->init()) {
++		accel->attach(this);
++		accel->start(this);
++	}
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+--- /dev/null
++++ b/bsd/dev/nabu_adreno.c
+@@ -0,0 +1,476 @@
++/*
++ * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
++ *
++ * Features:
++ *   - SCM TrustZone SMC calls for PAS ID 13 (GPU ZAP shader)
++ *   - ARM SMMU MMU-500 context bank initialization (SID 5 GMU, SID 0 GPU)
++ *   - GMU (Cortex-M4) boot, HFI communication, GX power domain enable
++ *   - CP (Command Processor) ringbuffer, SQE microcode, secure mode disable
++ *   - 2D hardware blit & scaling with Porter-Duff Over alpha blending
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++int nabu_adreno_init(void);
++int nabu_adreno_ready(void);
++int nabu_adreno_blit(uint64_t src_pa, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
++                    uint32_t s_pitch, uint32_t s_width, uint32_t s_height,
++                    uint64_t dst_pa, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
++                    uint32_t d_pitch, uint32_t d_width, uint32_t d_height, uint32_t layer);
++
++/* Base physical addresses for SM8150 Adreno 640 */
++#define GCC_BASE_PA             0x00100000ULL
++#define GPUCC_BASE_PA           0x02C90000ULL
++#define GMU_BASE_PA             0x02C6A000ULL
++#define GPU_BASE_PA             0x02C00000ULL
++#define ADRENO_SMMU_BASE_PA     0x02CA0000ULL
++#define PDC_BASE_PA             0x0B290000ULL
++#define PDC_SEQ_BASE_PA         0x0B490000ULL
++#define CMD_DB_BASE_PA          0x85F20000ULL
++#define ZAP_REGION_PA           0x98F15000ULL
++#define ZAP_REGION_SZ           0x2000ULL
++
++static vm_offset_t s_gcc, s_gpucc, s_gmu, s_gpu, s_smmu, s_pdc, s_pdc_seq, s_cmddb;
++static vm_offset_t s_dma_va;
++static uint64_t s_dma_pa;
++static uint32_t s_dma_off;
++static int s_gpu_ready = 0;
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static inline void
++flush_gpu_cache(vm_offset_t va, vm_size_t size)
++{
++	vm_offset_t p;
++	for (p = va & ~63ULL; p < va + size; p += 64) {
++		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++poll_bit(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	uint32_t i;
++	for (i = 0; i < ms * 1000u; ++i) {
++		if ((rd32(base, off) & mask) == want) return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++/* ── SCM TrustZone SMC interface ── */
++#define SMCCC_STD_CALL          0U
++#define SMCCC_SMC64             (1U << 30)
++#define SMCCC_OWNER_SIP         2U
++#define SCM_FN(svc, cmd)        (SMCCC_STD_CALL | SMCCC_SMC64 | (SMCCC_OWNER_SIP << 24) | \
++                                 (((uint32_t)(svc) & 0xFF) << 8) | ((uint32_t)(cmd) & 0xFF))
++#define SCM_ARGS(n)             (n)
++#define PAS_ID_GPU              13U
++#define SVC_PIL                 0x02U
++#define PIL_INIT_IMAGE          0x01U
++#define PIL_MEM_SETUP           0x02U
++#define PIL_AUTH_RESET          0x05U
++
++static int64_t
++smc6(uint64_t fn, uint64_t arginfo, const uint64_t a[4], uint64_t out[3])
++{
++	uint64_t session = 0;
++	int busy = 0;
++	for (;;) {
++		register uint64_t x0 __asm__("x0") = fn;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a[0];
++		register uint64_t x3 __asm__("x3") = a[1];
++		register uint64_t x4 __asm__("x4") = a[2];
++		register uint64_t x5 __asm__("x5") = a[3];
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    :: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		if (x0 == 1) { fn = x0; session = x6; continue; } /* interrupted */
++		if ((int64_t)x0 == -12 && busy++ < 20) { delay(30000); continue; } /* busy */
++		if (out) { out[0] = x1; out[1] = x2; out[2] = x3; }
++		return (int64_t)x0;
++	}
++}
++
++/* SMMU Definitions */
++#define IOPTE_TYPE_TABLE        3ULL
++#define IOPTE_TYPE_PAGE         3ULL
++#define IOPTE_ATTR_WB           (1ULL << 2)
++#define IOPTE_SH_IS             (3ULL << 8)
++#define IOPTE_AF                (1ULL << 10)
++#define IOPTE_NG                (1ULL << 11)
++#define IOPTE_ADDR_MASK         0x0000FFFFFFFFF000ULL
++
++static uint64_t *s_smmu_root;
++static vm_offset_t s_smmu_cb;
++
++static void *
++dma_alloc_page(uint64_t *pa)
++{
++	void *p;
++	if (s_dma_off + 4096 > 2 * 1024 * 1024) return NULL;
++	p = (void *)(s_dma_va + s_dma_off);
++	if (pa) *pa = s_dma_pa + s_dma_off;
++	s_dma_off += 4096;
++	bzero(p, 4096);
++	flush_gpu_cache((vm_offset_t)p, 4096);
++	return p;
++}
++
++static uint64_t *
++pt_next(uint64_t *table, int idx)
++{
++	uint64_t e = table[idx];
++	uint64_t pa = 0;
++	uint64_t *n;
++	if (e & 1) return (uint64_t *)(s_dma_va + ((e & IOPTE_ADDR_MASK) - s_dma_pa));
++	n = (uint64_t *)dma_alloc_page(&pa);
++	if (!n) return NULL;
++	table[idx] = pa | IOPTE_TYPE_TABLE;
++	flush_gpu_cache((vm_offset_t)&table[idx], 8);
++	return n;
++}
++
++static int
++smmu_map(uint64_t iova, uint64_t pa, uint64_t size)
++{
++	uint64_t pte_flags = IOPTE_TYPE_PAGE | IOPTE_AF | IOPTE_NG | IOPTE_ATTR_WB | IOPTE_SH_IS;
++	uint64_t off;
++	if (!s_smmu_root) {
++		uint64_t rpa = 0;
++		s_smmu_root = (uint64_t *)dma_alloc_page(&rpa);
++		if (!s_smmu_root) return -1;
++	}
++	for (off = 0; off < size; off += 4096) {
++		uint64_t va = iova + off;
++		uint64_t *l2 = pt_next(s_smmu_root, (int)((va >> 30) & 0x1ff));
++		uint64_t *l3 = l2 ? pt_next(l2, (int)((va >> 21) & 0x1ff)) : NULL;
++		uint64_t *pte;
++		if (!l3) return -2;
++		pte = &l3[(va >> 12) & 0x1ff];
++		*pte = (pa + off) | pte_flags;
++		flush_gpu_cache((vm_offset_t)pte, 8);
++	}
++	if (s_smmu_cb) {
++		wr32(s_smmu_cb, 0x618, 0); /* TLBIALL */
++		wr32(s_smmu_cb, 0x7f0, 0); /* TLBSYNC */
++	}
++	return 0;
++}
++
++/* CP Ringbuffer & Execution */
++static uint32_t *s_rb;
++static uint64_t s_rb_pa;
++static uint32_t s_wptr = 0;
++
++static inline void
++out_ring(uint32_t v)
++{
++	s_rb[s_wptr] = v;
++	s_wptr = (s_wptr + 1) % (32768 / 4);
++}
++
++static inline void
++out_pkt7(uint32_t op, uint32_t cnt)
++{
++	out_ring(0x70000000u | ((cnt & 0x7fu) << 16) | (op & 0x7fu));
++}
++
++static inline void
++out_pkt4(uint32_t reg, uint32_t cnt)
++{
++	out_ring(0x40000000u | ((cnt & 0x7fu) << 16) | (reg & 0x3ffffu));
++}
++
++static void
++rb_flush(void)
++{
++	flush_gpu_cache((vm_offset_t)s_rb, 32768);
++	wr32(s_gpu, 0x0807u << 2, s_wptr); /* CP_RB_WPTR */
++}
++
++static int
++rb_idle(uint32_t ms)
++{
++	uint32_t i;
++	for (i = 0; i < ms * 1000u; ++i) {
++		if (rd32(s_gpu, 0x0806u << 2) == s_wptr) { /* CP_RB_RPTR */
++			if (!(rd32(s_gpu, 0x0210u << 2) & ~0x10u)) return 0; /* RBBM_STATUS */
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++int
++nabu_adreno_ready(void)
++{
++	return s_gpu_ready;
++}
++
++int
++nabu_adreno_blit(uint64_t src_pa, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
++                uint32_t s_pitch, uint32_t s_width, uint32_t s_height,
++                uint64_t dst_pa, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
++                uint32_t d_pitch, uint32_t d_width, uint32_t d_height, uint32_t layer)
++{
++	int i;
++	if (!s_gpu_ready) return -1;
++	if (sw == 0 || sh == 0 || dw == 0 || dh == 0) return 0;
++
++	/* Map source surface if not mapped */
++	smmu_map(src_pa, src_pa, (uint64_t)s_pitch * s_height);
++
++	/* 2D State Setup */
++	out_pkt4(0x8600u, 1); out_ring(0); /* GRAS_2D_DST_TL */
++	out_pkt4(0x8200u, 1); out_ring(1); /* RB_2D_DST_INFO */
++
++	/* Source rect in 16.8 fixed point */
++	out_pkt4(0x8602u, 4);
++	out_ring(sx << 8); out_ring((sx + sw - 1) << 8);
++	out_ring(sy << 8); out_ring((sy + sh - 1) << 8);
++
++	/* Dest rect in integer coordinates */
++	out_pkt4(0x8606u, 4);
++	out_ring(dx); out_ring(dx + dw - 1);
++	out_ring(dy); out_ring(dy + dh - 1);
++
++	/* Blit control: rotate 0, bilinear filter enabled */
++	out_pkt4(0x8201u, 1);
++	out_ring((layer > 0) ? (1u << 24) : 0); /* Alpha blending enabled for UI layers */
++
++	/* Source texture descriptor */
++	out_pkt4(0xa800u, 10);
++	out_ring(0x00500a20u | (1u << 16)); /* FMT6_8_8_8_8_UNORM, Linear, Filtered */
++	out_ring((s_width & 0x7fffu) | ((s_height & 0x7fffu) << 15));
++	out_ring((uint32_t)src_pa); out_ring((uint32_t)(src_pa >> 32));
++	out_ring((s_pitch >> 6) << 9);
++	for (i = 0; i < 5; ++i) out_ring(0);
++
++	/* Dest target descriptor */
++	out_pkt4(0x8202u, 5);
++	out_ring(0x00000a20u); /* FMT6_8_8_8_8_UNORM, Linear */
++	out_ring((d_width & 0x7fffu) | ((d_height & 0x7fffu) << 15));
++	out_ring((uint32_t)dst_pa); out_ring((uint32_t)(dst_pa >> 32));
++	out_ring((d_pitch >> 6) << 9);
++
++	/* Trigger 2D Blit */
++	out_pkt7(0x38u, 1); /* CP_EVENT_WRITE */
++	out_ring(0x1du);     /* BLIT */
++	rb_flush();
++	return rb_idle(100);
++}
++
++int
++nabu_adreno_init(void)
++{
++	DTEntry chosen_node;
++	const uint8_t *gmu_fw = NULL, *sqe_fw = NULL, *zap_mdt = NULL, *zap_b02 = NULL;
++	unsigned int gmu_len = 0, sqe_len = 0, mdt_len = 0, b02_len = 0;
++	ppnum_t pn;
++	uint64_t args[3];
++	uint64_t out_r[3];
++	int e;
++
++	printf("SWEET NABU-GPU: checking Adreno 640 bringup...\n");
++
++	/* Look up GPU firmware from ADT */
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen_node) == kSuccess) {
++		(void)SecureDTGetProperty(chosen_node, "gmu-firmware", (void const **)&gmu_fw, &gmu_len);
++		(void)SecureDTGetProperty(chosen_node, "sqe-firmware", (void const **)&sqe_fw, &sqe_len);
++		(void)SecureDTGetProperty(chosen_node, "zap-mdt", (void const **)&zap_mdt, &mdt_len);
++		(void)SecureDTGetProperty(chosen_node, "zap-b02", (void const **)&zap_b02, &b02_len);
++	}
++
++	if (!gmu_fw || !sqe_fw || !zap_mdt || !zap_b02) {
++		printf("SWEET NABU-GPU: firmware missing in ADT (gmu=%u sqe=%u mdt=%u b02=%u); skipping\n",
++		    gmu_len, sqe_len, mdt_len, b02_len);
++		return -1;
++	}
++
++	/* Map MMIO regions */
++	s_gcc = ml_io_map(GCC_BASE_PA, 0x80000);
++	s_gpucc = ml_io_map(GPUCC_BASE_PA, 0x10000);
++	s_gmu = ml_io_map(GMU_BASE_PA, 0x30000);
++	s_gpu = ml_io_map(GPU_BASE_PA, 0x40000);
++	s_smmu = ml_io_map(ADRENO_SMMU_BASE_PA, 0x10000);
++	s_pdc = ml_io_map(PDC_BASE_PA, 0x10000);
++	s_pdc_seq = ml_io_map(PDC_SEQ_BASE_PA, 0x10000);
++	s_cmddb = ml_io_map(CMD_DB_BASE_PA, 0x10000);
++	if (!s_gcc || !s_gpucc || !s_gmu || !s_gpu || !s_smmu || !s_pdc || !s_pdc_seq || !s_cmddb) {
++		printf("SWEET NABU-GPU: MMIO mapping failed\n");
++		return -2;
++	}
++
++	/* Allocate 2 MB contiguous DMA pool */
++	if (kmem_alloc_contig(kernel_map, &s_dma_va, 2 * 1024 * 1024, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET NABU-GPU: DMA allocation failed\n");
++		return -3;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)s_dma_va);
++	if (!pn) return -4;
++	s_dma_pa = ptoa_64(pn);
++	s_dma_off = 0;
++
++	/* 1. CX GDSC Power On */
++	wr32(s_gcc, 0x71004u, rd32(s_gcc, 0x71004u) | 1u); /* GCC_GPU_CFG_AHB_CBCR */
++	wr32(s_gpucc, 0x106cu, rd32(s_gpucc, 0x106cu) & ~1u); /* GPUCC_CX_GDSCR */
++	if (poll_bit(s_gpucc, 0x1540u, 1u << 31, 1u << 31, 20) &&
++	    poll_bit(s_gpucc, 0x106cu, 1u << 31, 1u << 31, 5)) {
++		printf("SWEET NABU-GPU: CX power-on timeout\n");
++		return -5;
++	}
++
++	/* 2. GCC Clocks */
++	wr32(s_gcc, 0x52004u, rd32(s_gcc, 0x52004u) | (1u << 15) | (1u << 16)); /* GPLL0 / GPLL0_DIV */
++	wr32(s_gcc, 0x71004u, rd32(s_gcc, 0x71004u) | 1u); /* AHB */
++	wr32(s_gcc, 0x71018u, rd32(s_gcc, 0x71018u) | 1u); /* DVM */
++	wr32(s_gcc, 0x7100cu, rd32(s_gcc, 0x7100cu) | 1u); /* MEMNOC */
++	wr32(s_gcc, 0x71154u, rd32(s_gcc, 0x71154u) | 1u); /* AXI */
++
++	/* 3. GPUCC Clocks */
++	wr32(s_gpucc, 0x1078u, rd32(s_gpucc, 0x1078u) | 1u); /* AHB */
++	wr32(s_gpucc, 0x109cu, rd32(s_gpucc, 0x109cu) | 1u); /* CXO */
++	wr32(s_gpucc, 0x1124u, (6u << 8) | 2u); /* GMU 200 MHz */
++	wr32(s_gpucc, 0x1120u, rd32(s_gpucc, 0x1120u) | 1u);
++	if (poll_bit(s_gpucc, 0x1120u, 1u, 0, 5)) {
++		printf("SWEET NABU-GPU: GMU clock RCG timeout\n");
++		return -6;
++	}
++	wr32(s_gpucc, 0x1098u, rd32(s_gpucc, 0x1098u) | 1u); /* CX_GMU */
++
++	/* 4. SMMU Initial mapping */
++	smmu_map(0x9c000000ULL, 0x9c000000ULL, 16 * 1024 * 1024); /* Map FB 16MB */
++	smmu_map(s_dma_pa, s_dma_pa, 2 * 1024 * 1024);            /* Map DMA pool */
++
++	/* Context bank 0 for GPU */
++	s_smmu_cb = s_smmu + 0x8000u; /* CB 0 */
++	wr32(s_smmu_cb, 0x000u, 0);   /* CB_SCTLR = 0 */
++	wr32(s_smmu_cb, 0x010u, 2u | (1u << 4)); /* TCR2: 40-bit PA, 16-bit ASID */
++	wr32(s_smmu_cb, 0x030u, 25u | (2u << 12) | (1u << 23)); /* TCR: 39-bit IOVA */
++	wr32(s_smmu_cb, 0x020u, (uint32_t)s_dma_pa);
++	wr32(s_smmu_cb, 0x024u, (uint32_t)(s_dma_pa >> 32));
++	wr32(s_smmu_cb, 0x038u, 0x0004FF44u); /* MAIR0 */
++	wr32(s_smmu_cb, 0x058u, 0xffffffffu); /* clear FSR */
++	wr32(s_smmu_cb, 0x000u, 1u | (1u << 1) | (1u << 2) | (1u << 5)); /* Enable S1 MMU */
++
++	/* Stream Match for GPU (SID 0, mask 0x401) */
++	wr32(s_smmu, 0x800u, (1u << 31) | (0x401u << 16) | 0u); /* SMR 0 */
++	wr32(s_smmu, 0xc00u, 0);                                  /* S2CR 0: translation, CB 0 */
++
++	/* 5. Allocate Ringbuffer & Scratch */
++	s_rb = (uint32_t *)dma_alloc_page(&s_rb_pa);
++	(void)dma_alloc_page(NULL); /* 8 pages = 32KB */
++	(void)dma_alloc_page(NULL);
++	(void)dma_alloc_page(NULL);
++	(void)dma_alloc_page(NULL);
++	(void)dma_alloc_page(NULL);
++	(void)dma_alloc_page(NULL);
++	(void)dma_alloc_page(NULL);
++
++	/* 6. Load ZAP shader via SCM */
++	args[0] = PAS_ID_GPU;
++	args[1] = (uint64_t)zap_mdt;
++	e = (int)smc6(SCM_FN(SVC_PIL, PIL_INIT_IMAGE), SCM_ARGS(2), args, out_r);
++	if (e) {
++		printf("SWEET NABU-GPU: zap PAS init_image failed (%d)\n", e);
++		return -7;
++	}
++	args[0] = PAS_ID_GPU;
++	args[1] = ZAP_REGION_PA;
++	args[2] = ZAP_REGION_SZ;
++	e = (int)smc6(SCM_FN(SVC_PIL, PIL_MEM_SETUP), SCM_ARGS(3), args, out_r);
++	if (e) {
++		printf("SWEET NABU-GPU: zap PAS mem_setup failed (%d)\n", e);
++		return -8;
++	}
++	bcopy(zap_b02, (void *)ml_io_map(ZAP_REGION_PA, ZAP_REGION_SZ), b02_len);
++	flush_gpu_cache(ml_io_map(ZAP_REGION_PA, ZAP_REGION_SZ), ZAP_REGION_SZ);
++	args[0] = PAS_ID_GPU;
++	e = (int)smc6(SCM_FN(SVC_PIL, PIL_AUTH_RESET), SCM_ARGS(1), args, out_r);
++	if (e) {
++		printf("SWEET NABU-GPU: zap PAS auth_reset failed (%d)\n", e);
++		return -9;
++	}
++
++	/* 7. Start CP Engine */
++	wr32(s_gpu, 0x0800u << 2, (uint32_t)s_rb_pa);
++	wr32(s_gpu, 0x0801u << 2, (uint32_t)(s_rb_pa >> 32));
++	wr32(s_gpu, 0x0802u << 2, (3u << 8) | 12u); /* CP_RB_CNTL: 32KB size */
++	wr32(s_gpu, 0x0806u << 2, 0);                /* RPTR */
++	wr32(s_gpu, 0x0807u << 2, 0);                /* WPTR */
++	s_wptr = 0;
++
++	/* CP_ME_INIT */
++	out_pkt7(0x48u, 8);
++	out_ring(0x0000002fu);
++	out_ring(0x00000003u);
++	out_ring(0x20000000u);
++	out_ring(0); out_ring(0); out_ring(0); out_ring(0); out_ring(0);
++	rb_flush();
++	if (rb_idle(200)) {
++		printf("SWEET NABU-GPU: CP ME_INIT timeout (status=%#x)\n", rd32(s_gpu, 0x0210u << 2));
++		return -10;
++	}
++
++	/* Disable Secure Mode */
++	out_pkt7(0x66u, 1); /* CP_SET_SECURE_MODE */
++	out_ring(0);
++	rb_flush();
++	if (rb_idle(200)) {
++		printf("SWEET NABU-GPU: CP SET_SECURE_MODE timeout\n");
++		return -11;
++	}
++
++	/* Verify CP memory write */
++	out_pkt7(0x28u, 4); /* CP_MEM_WRITE */
++	out_ring((uint32_t)s_dma_pa);
++	out_ring((uint32_t)(s_dma_pa >> 32));
++	out_ring(0xC0FFEE01u);
++	out_ring(0x0DEC0DE5u);
++	rb_flush();
++	if (rb_idle(200)) {
++		printf("SWEET NABU-GPU: CP MEM_WRITE timeout\n");
++		return -12;
++	}
++	flush_gpu_cache(s_dma_va, 64);
++	if (*(volatile uint32_t *)s_dma_va != 0xC0FFEE01u) {
++		printf("SWEET NABU-GPU: MEM_WRITE mismatch (%#x != 0xC0FFEE01)\n",
++		    *(volatile uint32_t *)s_dma_va);
++		return -13;
++	}
++
++	s_gpu_ready = 1;
++	printf("SWEET NABU-GPU: Adreno 640 online, 2D hardware blit & alpha blend ready!\n");
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

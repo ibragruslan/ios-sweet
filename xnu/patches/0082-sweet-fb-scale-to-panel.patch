@@ -27,7 +27,7 @@
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -390,11 +394,33 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -390,11 +394,47 @@ AppleCLCD::present(const uint8_t *rec)
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -60,7 +60,21 @@
 +				    (uint64_t)pdx * 4);
 +				uint32_t xacc = 0;
 +				for (int32_t px = 0; px < pw; px++) {
-+					dp[px] = sp[xacc >> 16];
++					uint32_t spx = sp[xacc >> 16];
++					if (layer == 0) {
++						dp[px] = spx | 0xff000000u;
++					} else {
++						uint32_t a = spx >> 24;
++						if (a == 255) {
++							dp[px] = spx;
++						} else if (a != 0) {
++							uint32_t dpx = dp[px];
++							uint32_t inv_a = 255 - a;
++							uint32_t rb = (spx & 0x00ff00ffu) + (((dpx & 0x00ff00ffu) * inv_a) >> 8);
++							uint32_t g  = (spx & 0x0000ff00u) + (((dpx & 0x0000ff00u) * inv_a) >> 8);
++							dp[px] = (rb & 0x00ff00ffu) | (g & 0x0000ff00u) | 0xff000000u;
++						}
++					}
 +					xacc += xstep;
 +				}
  			}
