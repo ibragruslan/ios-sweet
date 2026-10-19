@@ -1,24 +1,23 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,3 +108,4 @@
- bsd/dev/sweet_keys.c			standard
- bsd/dev/sweet_touch.c			standard
+@@ -111,4 +111,5 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
 +bsd/dev/nabu_touch.c			standard
  bsd/dev/mem.c				standard
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -48,5 +48,6 @@
- extern void sweet_keys_init(void);
+@@ -53,4 +53,5 @@
  extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
 +extern void nabu_touch_init(void);
  
  #define REG_CAP         0x00
- #define REG_IS          0x20
-@@ -604,6 +605,7 @@
- 	sweet_sample_start();
- 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+@@ -660,5 +661,6 @@
  	sweet_keys_init();
  	sweet_touch_init();
+ 	sweet_usb_probe();
 +	nabu_touch_init();
  	return 0;
  }
