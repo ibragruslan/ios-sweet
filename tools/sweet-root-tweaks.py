@@ -29,7 +29,11 @@ screen (image versions v8-v14 in NOTES.md):
 """
 import glob, os, plistlib, shutil, sys
 
-BUILD, VERSION = '20H392', '16.7.16'
+# Filled in main() from the root's own SystemVersion.plist, so the migration
+# skip and the activation data ark match the exact IPSW build (hardcoding e.g.
+# 20H392 on a 20H350 image makes LastSystemVersion != the running build, so
+# DataMigration runs for ~1 h every boot and the device never reaches the GUI).
+BUILD, VERSION = None, None
 MOBILE = 501
 
 
@@ -126,6 +130,10 @@ def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
+    global BUILD, VERSION
+    sv = load(os.path.join(root, 'System/Library/CoreServices/SystemVersion.plist'))
+    BUILD, VERSION = sv['ProductBuildVersion'], sv['ProductVersion']
+    print('detected build', BUILD, VERSION)
     launchd(root)
     containers(root)
     activation(root)

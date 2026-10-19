@@ -23,7 +23,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,868 @@
+@@ -0,0 +1,895 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
@@ -718,11 +718,13 @@
 +		uint32_t bit = 1u << id;
 +		if (mask & bit) {
 +			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				printf("SWEET NABU-TOUCH: TOUCH DOWN f=%u x=%d y=%d\n", id, x[id], y[id]);
 +				sweet_hid_touch((int)id, 1, x[id], y[id]);
 +			}
 +			st.x[id] = x[id];
 +			st.y[id] = y[id];
 +		} else if (st.active & bit) {
++			printf("SWEET NABU-TOUCH: TOUCH UP f=%u\n", id);
 +			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
 +		}
 +	}
@@ -738,6 +740,17 @@
 +	int err = nt_read(NVT_EVENT_BUF, (uint8_t)(NVT_EVENT_BUF & 0x7fu), d, sizeof(d));
 +	if (err) {
 +		return err;
++	}
++	bool any = false;
++	for (unsigned i = 0; i < sizeof(d); ++i) {
++		if (d[i] != 0) {
++			any = true;
++			break;
++		}
++	}
++	if (any) {
++		printf("SWEET NABU-TOUCH: raw: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
 +	}
 +	for (unsigned i = 0; i < NT_MAX; ++i) {
 +		const uint8_t *p = d + 6u * i;
@@ -793,10 +806,15 @@
 +	nt_gpio_set(st.tlmm_south, 122, 1);
 +	/* gpio39 -> IRQ input on NORTH tile */
 +	nt_gpio(st.tlmm_north, 39, 0, 1, 4, 0);
-+	/* gpio12 -> RESET output on NORTH tile: pulse LOW for 10ms then release HIGH */
++	/* gpio12 -> RESET output on NORTH tile: hold HIGH (do not pulse low unless nabutouchrst=1) */
++	int do_rst = 0;
++	(void)PE_parse_boot_argn("nabutouchrst", &do_rst, sizeof(do_rst));
 +	nt_gpio(st.tlmm_north, 12, 0, 0, 1, 1);
-+	nt_gpio_set(st.tlmm_north, 12, 0);
-+	nt_wait(10);
++	if (do_rst) {
++		printf("SWEET NABU-TOUCH: pulsing RESET low\n");
++		nt_gpio_set(st.tlmm_north, 12, 0);
++		nt_wait(10);
++	}
 +	nt_gpio_set(st.tlmm_north, 12, 1);
 +	nt_wait(20);
 +	if (!nt_clocks()) {
@@ -831,6 +849,10 @@
 +	int te = nt_read(0x3f004u, 0x3f004u & 0x7fu, trim, sizeof(trim));
 +	printf("SWEET NABU-TOUCH: chip trim err=%d [%02x %02x %02x %02x %02x %02x]\n",
 +	    te, trim[0], trim[1], trim[2], trim[3], trim[4], trim[5]);
++	uint8_t rst_state[6] = { 0 };
++	int re = nt_read(0x2fe00u, 0x60u, rst_state, sizeof(rst_state));
++	printf("SWEET NABU-TOUCH: rst_state err=%d [%02x %02x %02x %02x %02x %02x] (want 0xA3)\n",
++	    re, rst_state[0], rst_state[1], rst_state[2], rst_state[3], rst_state[4], rst_state[5]);
 +	uint8_t fi[17] = { 0 };
 +	int fe = nt_read(NVT_EVENT_BUF, NVT_FWINFO_OFF, fi, sizeof(fi));
 +	printf("SWEET NABU-TOUCH: fwinfo err=%d ver=%02x inv=%02x xy=%u,%u res=%u,%u irq=%#x\n",
@@ -847,7 +869,7 @@
 +	} else {
 +		printf("SWEET NABU-TOUCH: no valid fwinfo; polling anyway (1600x2560)\n");
 +	}
-+	unsigned errors = 0;
++	unsigned errors = 0, pcount = 0;
 +	while (!st.dead) {
 +		int err = nt_poll();
 +		if (err) {
@@ -860,8 +882,13 @@
 +		} else {
 +			errors = 0;
 +		}
++		if ((++pcount % 300u) == 0) {
++			uint32_t irq_val = (nt_rd(st.tlmm_north, 39u * 0x1000u + 4u) >> 0) & 1u;
++			printf("SWEET NABU-TOUCH: hb #%u irq_gpio39=%u\n", pcount, irq_val);
++		}
 +		nt_wait(10);
 +	}
++	printf("SWEET NABU-TOUCH: loop exited! st.dead=%d\n", st.dead);
 +	nt_report(0, st.x, st.y);
 +out:
 +	(void)thread_terminate(current_thread());
