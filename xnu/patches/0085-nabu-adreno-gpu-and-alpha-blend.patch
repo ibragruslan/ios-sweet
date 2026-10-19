@@ -1,64 +1,21 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 62f3923..52a5a0e 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,5 +112,6 @@
- bsd/dev/sweet_spmi.c			standard
+@@ -113,6 +113,7 @@ bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
  bsd/dev/nabu_touch.c			standard
  bsd/dev/nabu_backlight.c		standard
 +bsd/dev/nabu_adreno.c			standard
  bsd/dev/mem.c				standard
---- a/bsd/dev/sweet_ufs.c
-+++ b/bsd/dev/sweet_ufs.c
-@@ -54,5 +54,6 @@
- extern void sweet_usb_probe(void);
- extern void nabu_touch_init(void);
- extern void nabu_backlight_init(void);
-+extern void nabu_adreno_init(void);
- 
- #define REG_CAP         0x00
-@@ -662,6 +663,7 @@
- 	sweet_touch_init();
- 	sweet_usb_probe();
- 	nabu_touch_init();
- 	nabu_backlight_init();
-+	nabu_adreno_init();
- 	return 0;
- }
---- a/iokit/Kernel/arm/SweetFramebuffer.cpp
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -64,6 +64,12 @@
- };
- 
- extern "C" int nabu_backlight_set_power(int on);
-+extern "C" int nabu_adreno_ready(void);
-+extern "C" int nabu_adreno_blit(uint64_t src_pa, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
-+    uint32_t s_pitch, uint32_t s_width, uint32_t s_height,
-+    uint64_t dst_pa, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
-+    uint32_t d_pitch, uint32_t d_width, uint32_t d_height, uint32_t layer);
-+
- #define SWEET_FB_SWAP_REC_SIZE          0x46c
-@@ -438,6 +444,21 @@
- 			if (pdx < 0) { pdx = 0; }
- 			if (pdy < 0) { pdy = 0; }
- 			if (pw > (int32_t)fWidth  - pdx) { pw = (int32_t)fWidth  - pdx; }
- 			if (ph > (int32_t)fHeight - pdy) { ph = (int32_t)fHeight - pdy; }
-+			if (nabu_adreno_ready()) {
-+				uint64_t src_pa = (uint64_t)s->memory->getPhysicalAddress() + s->offset;
-+				if (src_pa != 0) {
-+					int r = nabu_adreno_blit(src_pa, sx, sy, w, h,
-+					    s->bytesPerRow, s->width, s->height,
-+					    fPhys, pdx, pdy, pw, ph,
-+					    fRowBytes, fWidth, fHeight, layer);
-+					if (r == 0) {
-+						s->release();
-+						continue;
-+					}
-+				}
-+			}
- 			uint32_t xstep = pw > 0 ? (((uint32_t)w << 16) / (uint32_t)pw) : 0;
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/nabu_adreno.c b/bsd/dev/nabu_adreno.c
+new file mode 100644
+index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,890 @@
+@@ -0,0 +1,1164 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -1223,4 +1180,59 @@
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
-+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5195e7f..48d1ebc 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void nabu_touch_init(void);
+ extern void nabu_backlight_init(void);
++extern void nabu_adreno_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -664,6 +665,7 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ 	nabu_touch_init();
+ 	nabu_backlight_init();
++	nabu_adreno_init();
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0c37b64..dd2dc35 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,11 @@ enum {
+ };
+ 
+ extern "C" int nabu_backlight_set_power(int on);
++extern "C" int nabu_adreno_ready(void);
++extern "C" int nabu_adreno_blit(uint64_t src_pa, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
++    uint32_t s_pitch, uint32_t s_width, uint32_t s_height,
++    uint64_t dst_pa, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
++    uint32_t d_pitch, uint32_t d_width, uint32_t d_height, uint32_t layer);
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+@@ -410,6 +415,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 			if (pdy < 0) { pdy = 0; }
+ 			if (pw > (int32_t)fWidth  - pdx) { pw = (int32_t)fWidth  - pdx; }
+ 			if (ph > (int32_t)fHeight - pdy) { ph = (int32_t)fHeight - pdy; }
++			if (nabu_adreno_ready()) {
++				uint64_t src_pa = (uint64_t)s->memory->getPhysicalAddress() + s->offset;
++				if (src_pa != 0) {
++					int r = nabu_adreno_blit(src_pa, sx, sy, w, h,
++					    s->bytesPerRow, s->width, s->height,
++					    fPhys, pdx, pdy, pw, ph,
++					    fRowBytes, fWidth, fHeight, layer);
++					if (r == 0) {
++						s->release();
++						continue;
++					}
++				}
++			}
+ 			uint32_t xstep = pw > 0 ? (((uint32_t)w << 16) / (uint32_t)pw) : 0;
+ 			uint32_t ystep = ph > 0 ? (((uint32_t)h << 16) / (uint32_t)ph) : 0;
+ 			for (int32_t py = 0; py < ph; py++) {
