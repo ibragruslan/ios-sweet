@@ -458,7 +458,7 @@ index 0000000..7e770a0
 +	d->cb = base + 0x8000ULL + (uint64_t)target_cb * 0x1000ULL;
 +
 +	/* GR1: CBAR & CBA2R */
-+	wr32(base, 0x1000u + target_cb * 4, 0); /* CBARn: Stage 1 */
++	wr32(base, 0x1000u + target_cb * 4, 1u << 16); /* CBARn: Stage 1 translation, Stage 2 bypass */
 +	wr32(base, 0x1800u + target_cb * 4, 1); /* CBA2Rn: VA64 (AArch64 64-bit format) */
 +
 +	/* SMR & S2CR */
@@ -470,7 +470,7 @@ index 0000000..7e770a0
 +	wr32(d->cb, 0x000u, 0); /* CB_SCTLR = 0 */
 +	wr32(d->cb, 0x004u, rd32(d->cb, 0x004u) & ~2u); /* ACTLR */
 +	wr32(d->cb, 0x010u, 2u | (1u << 4)); /* TCR2: 40-bit PA, 16-bit ASID */
-+	wr32(d->cb, 0x030u, 25u | (2u << 12) | (1u << 23)); /* TCR: 39-bit IOVA */
++	wr32(d->cb, 0x030u, 25u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23)); /* TCR: 39-bit IOVA */
 +	uint64_t rpa = s_dma_pa + ((uint64_t)(uintptr_t)d->root - s_dma_va);
 +	uint64_t ttbr = rpa | ((uint64_t)target_cb << 48);
 +	wr32(d->cb, 0x020u, (uint32_t)ttbr);
