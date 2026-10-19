@@ -32,8 +32,13 @@
 +extern "C" int nabu_backlight_set_power(int on);
 +
  #define SWEET_FB_SWAP_REC_SIZE          0x46c
-@@ -539,7 +541,12 @@
+@@ -539,7 +541,17 @@
 +			int changed = 0;
++			int allow_off = 0;
++			PE_parse_boot_argn("sweetfb_poweroff", &allow_off, sizeof(allow_off));
++			if (!allow_off) {
++				off = false;
++			}
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;
