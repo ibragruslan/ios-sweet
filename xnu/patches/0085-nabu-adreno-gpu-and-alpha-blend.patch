@@ -83,7 +83,7 @@
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,478 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -97,6 +97,7 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <kern/clock.h>
 +#include <mach/mach_types.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
@@ -106,6 +107,7 @@
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void delay(int usec);
 +
 +int nabu_adreno_init(void);
 +int nabu_adreno_ready(void);
