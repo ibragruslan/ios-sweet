@@ -80,7 +80,7 @@
 +		accel->attach(this);
 +		accel->start(this);
 +	}
- 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
 @@ -0,0 +1,476 @@
