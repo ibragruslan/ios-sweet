@@ -1,4 +1,4 @@
-# ios-sweet
+# ios-nabu
 
 **Apple's iOS 16 running on a Xiaomi Pad 5.**
 
