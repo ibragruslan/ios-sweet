@@ -23,7 +23,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,1081 @@
+@@ -0,0 +1,1111 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
@@ -592,11 +592,11 @@
 +	return ETIMEDOUT;
 +}
 +
-+/* Full-duplex FIFO transfer of n bytes (n <= 96). CS bracketed by M_CMDs. */
++/* Full-duplex FIFO transfer of n bytes. CS bracketed by M_CMDs. */
 +static int
 +nt_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
 +{
-+	if (st.dead || n == 0 || n > 96) {
++	if (st.dead || n == 0 || n > 128) {
 +		return EIO;
 +	}
 +	if (!nt_wait_clear(st.se, G_STATUS, 1u)) {
@@ -609,8 +609,12 @@
 +	}
 +	nt_wr(st.se, G_M_IRQ_CLR, 0xffffffffu);
 +	nt_wr(st.se, SPI_TX_TRANS_LEN, n);
-+	nt_wr(st.se, SPI_RX_TRANS_LEN, n);
-+	nt_wr(st.se, G_M_CMD0, ((OP_TX | OP_RX) << OP_SHIFT) | FRAGMENTATION);
++	if (rx) {
++		nt_wr(st.se, SPI_RX_TRANS_LEN, n);
++		nt_wr(st.se, G_M_CMD0, ((OP_TX | OP_RX) << OP_SHIFT) | FRAGMENTATION);
++	} else {
++		nt_wr(st.se, G_M_CMD0, (OP_TX << OP_SHIFT) | FRAGMENTATION);
++	}
 +	nt_wr(st.se, G_TX_WATERMARK, 1);
 +	unsigned sent = 0, got = 0;
 +	int err = ETIMEDOUT;
@@ -636,19 +640,19 @@
 +				nt_wr(st.se, G_TX_WATERMARK, 0);
 +			}
 +		}
-+		uint32_t count = nt_rd(st.se, G_RX_FIFO_STATUS) & RX_WC_MSK;
-+		while (count--) {
-+			uint32_t word = nt_rd(st.se, G_RX_FIFO);
-+			for (unsigned j = 0; j < 4u && got < n; ++j) {
-+				if (rx) {
++		if (rx) {
++			uint32_t count = nt_rd(st.se, G_RX_FIFO_STATUS) & RX_WC_MSK;
++			while (count--) {
++				uint32_t word = nt_rd(st.se, G_RX_FIFO);
++				for (unsigned j = 0; j < 4u && got < n; ++j) {
 +					rx[got] = (uint8_t)(word >> (8u * j));
++					++got;
 +				}
-+				++got;
 +			}
 +		}
 +		if (irq & M_CMD_DONE) {
 +			nt_wr(st.se, G_M_IRQ_CLR, irq);
-+			err = (got >= n && sent >= n) ? 0 : EIO;
++			err = ((rx ? (got >= n) : 1) && sent >= n) ? 0 : EIO;
 +			break;
 +		}
 +		nt_wr(st.se, G_M_IRQ_CLR, irq & (M_RX_WATERMARK | M_RX_LAST | M_TX_WATERMARK));
@@ -661,9 +665,15 @@
 +	return err;
 +}
 +
++static uint32_t s_cur_page = 0xffffffff;
++
 +static int
 +nt_set_page(uint32_t addr)
 +{
++	uint32_t page = addr >> 7;
++	if (page == s_cur_page) {
++		return 0;
++	}
 +	uint8_t buf[3] = { NVT_WR(0xffu), (uint8_t)((addr >> 15) & 0xffu),
 +	    (uint8_t)((addr >> 7) & 0xffu) };
 +	if (st.dead) {
@@ -702,6 +712,9 @@
 +		nt_abort();
 +	}
 +	(void)nt_cmd(OP_CS_DEASSERT);
++	if (err == 0) {
++		s_cur_page = page;
++	}
 +	return err;
 +}
 +
@@ -764,11 +777,15 @@
 +		uint32_t cur = sram_addr + off;
 +		unsigned page_off = cur & 0x7fu;
 +		unsigned chunk = 128u - page_off;
++		if (chunk > 32u) {
++			chunk = 32u;
++		}
 +		if (chunk > (size - off)) {
 +			chunk = size - off;
 +		}
 +		int err = nt_write_buf(cur, data + off, chunk);
 +		if (err) {
++			printf("SWEET NABU-TOUCH: write_sram err %d at off %u/%u\n", err, off, size);
 +			return err;
 +		}
 +		off += chunk;
@@ -801,6 +818,8 @@
 +	printf("SWEET NABU-TOUCH: downloading touch firmware (%u bytes, ILM=%u DLM=%u)...\n",
 +	    fw_size, ilm_size + 1u, dlm_size + 1u);
 +
++	s_cur_page = 0xffffffff;
++
 +	/* 1. Bootloader reset */
 +	nt_write_addr(NT_SWRST_N8_ADDR, 0x69);
 +	nt_wait(5);
@@ -829,14 +848,17 @@
 +		printf("SWEET NABU-TOUCH: ILM write failed\n");
 +		return false;
 +	}
++	printf("SWEET NABU-TOUCH: ILM %u bytes OK\n", ilm_size + 1u);
 +	if (nt_write_sram(dlm_sram, fw + dlm_bin, dlm_size + 1u)) {
 +		printf("SWEET NABU-TOUCH: DLM write failed\n");
 +		return false;
 +	}
++	printf("SWEET NABU-TOUCH: DLM %u bytes OK\n", dlm_size + 1u);
 +	if (nt_write_sram(0x0002c178u, fw, 256u)) {
 +		printf("SWEET NABU-TOUCH: Header write failed\n");
 +		return false;
 +	}
++	printf("SWEET NABU-TOUCH: Header 256 bytes OK\n");
 +
 +	/* 5. Poll SPI_DMA_TX_INFO */
 +	uint8_t dma_info[1] = { 0xff };
@@ -846,6 +868,7 @@
 +		}
 +		nt_wait(1);
 +	}
++	printf("SWEET NABU-TOUCH: spi dma tx info = 0x%02x\n", dma_info[0]);
 +
 +	/* 6. Enable HW BLD CRC */
 +	uint8_t bld_crc[1] = { 0 };
@@ -872,6 +895,13 @@
 +		}
 +	}
 +	printf("SWEET NABU-TOUCH: timed out waiting for reset state (last=0x%02x)\n", st_buf[0]);
++	uint8_t bld_crc_res[1] = { 0 };
++	(void)nt_read(0x3F133u, 0x3F133u & 0x7fu, bld_crc_res, 1);
++	uint8_t r_ilm[4] = { 0 }, r_dlm[4] = { 0 };
++	(void)nt_read(0x3F120u, 0x3F120u & 0x7fu, r_ilm, 4);
++	(void)nt_read(0x3F124u, 0x3F124u & 0x7fu, r_dlm, 4);
++	printf("SWEET NABU-TOUCH: crc_flags=0x%02x r_ilm=0x%08x r_dlm=0x%08x\n",
++	    bld_crc_res[0], nt_le32(r_ilm), nt_le32(r_dlm));
 +	return false;
 +}
 +
