@@ -24,66 +24,9 @@
 +	nabu_adreno_init();
  	return 0;
  }
---- a/iokit/Kernel/arm/SweetFramebuffer.cpp
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -62,8 +62,36 @@
- 	kSweetFBIsMainDisplay           = 18,
- 	kSweetFBGetDotPitch             = 28,
- 	kSweetFBNotifications           = 72,
- };
- 
- extern "C" int nabu_backlight_set_power(int on);
-+
-+extern "C" int nabu_adreno_ready(void);
-+extern "C" int nabu_adreno_blit(uint64_t src_pa, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
-+                               uint32_t s_pitch, uint32_t s_width, uint32_t s_height,
-+                               uint64_t dst_pa, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
-+                               uint32_t d_pitch, uint32_t d_width, uint32_t d_height, uint32_t layer);
-+
-+class AppleM2ScalerCSCDriver : public IOService {
-+	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
-+public:
-+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
-+		registerService();
-+		return true;
-+	}
-+};
-+OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
-+
-+class IOAcceleratorES : public IOService {
-+	OSDeclareDefaultStructors(IOAcceleratorES);
-+public:
-+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
-+		setProperty("IOGLBundleName", "AppleMetal");
-+		setProperty("IOGVACodec", "AppleMetal");
-+		registerService();
-+		return true;
-+	}
-+};
-+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
- 
- #define SWEET_FB_SWAP_REC_SIZE          0x46c
-@@ -194,5 +221,17 @@
- 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
- 	setProperty("external", false);
- 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
-+	setProperty("backlight-control", kOSBooleanTrue);
- 	registerService();
-+
-+	AppleM2ScalerCSCDriver *scaler = OSTypeAlloc(AppleM2ScalerCSCDriver);
-+	if (scaler && scaler->init()) {
-+		scaler->attach(this);
-+		scaler->start(this);
-+	}
-+	IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
-+	if (accel && accel->init()) {
-+		accel->attach(this);
-+		accel->start(this);
-+	}
- 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,489 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -177,7 +120,13 @@
 +#define SMCCC_OWNER_SIP         2U
 +#define SCM_FN(svc, cmd)        (SMCCC_STD_CALL | SMCCC_SMC64 | (SMCCC_OWNER_SIP << 24) | \
 +                                 (((uint32_t)(svc) & 0xFF) << 8) | ((uint32_t)(cmd) & 0xFF))
-+#define SCM_ARGS(n)             (n)
++#define SCM_VAL                 0U
++#define SCM_RO                  1U
++#define SCM_RW                  2U
++#define SCM_ARGS_IMPL(n, a, b, c, d, ...) \
++    ((uint32_t)(n) | ((uint32_t)(a) << 4) | ((uint32_t)(b) << 6) | ((uint32_t)(c) << 8) | ((uint32_t)(d) << 10))
++#define SCM_ARGS(...)           SCM_ARGS_IMPL(__VA_ARGS__, 0, 0, 0, 0)
++
 +#define PAS_ID_GPU              13U
 +#define SVC_PIL                 0x02U
 +#define PIL_INIT_IMAGE          0x01U
@@ -386,6 +335,7 @@
 +	ppnum_t pn;
 +	uint64_t args[3];
 +	uint64_t out_r[3];
++	vm_offset_t zap_va;
 +	int e;
 +
 +	printf("SWEET NABU-GPU: checking Adreno 640 bringup...\n");
@@ -486,9 +436,11 @@
 +	(void)dma_alloc_page(NULL);
 +
 +	/* 6. Load ZAP shader via SCM */
++	bcopy(zap_mdt, (void *)s_dma_va, mdt_len);
++	flush_gpu_cache(s_dma_va, (mdt_len + 4095) & ~4095ULL);
 +	args[0] = PAS_ID_GPU;
-+	args[1] = (uint64_t)zap_mdt;
-+	e = (int)smc6(SCM_FN(SVC_PIL, PIL_INIT_IMAGE), SCM_ARGS(2), args, out_r);
++	args[1] = s_dma_pa;
++	e = (int)smc6(SCM_FN(SVC_PIL, PIL_INIT_IMAGE), SCM_ARGS(2, SCM_VAL, SCM_RW), args, out_r);
 +	if (e) {
 +		printf("SWEET NABU-GPU: zap PAS init_image failed (%d)\n", e);
 +		return -7;
@@ -496,15 +448,18 @@
 +	args[0] = PAS_ID_GPU;
 +	args[1] = ZAP_REGION_PA;
 +	args[2] = ZAP_REGION_SZ;
-+	e = (int)smc6(SCM_FN(SVC_PIL, PIL_MEM_SETUP), SCM_ARGS(3), args, out_r);
++	e = (int)smc6(SCM_FN(SVC_PIL, PIL_MEM_SETUP), SCM_ARGS(3, SCM_VAL, SCM_VAL, SCM_VAL), args, out_r);
 +	if (e) {
 +		printf("SWEET NABU-GPU: zap PAS mem_setup failed (%d)\n", e);
 +		return -8;
 +	}
-+	bcopy(zap_b02, (void *)ml_io_map(ZAP_REGION_PA, ZAP_REGION_SZ), b02_len);
-+	flush_gpu_cache(ml_io_map(ZAP_REGION_PA, ZAP_REGION_SZ), ZAP_REGION_SZ);
++	zap_va = ml_io_map(ZAP_REGION_PA, ZAP_REGION_SZ);
++	if (zap_va) {
++		bcopy(zap_b02, (void *)zap_va, b02_len);
++		flush_gpu_cache(zap_va, ZAP_REGION_SZ);
++	}
 +	args[0] = PAS_ID_GPU;
-+	e = (int)smc6(SCM_FN(SVC_PIL, PIL_AUTH_RESET), SCM_ARGS(1), args, out_r);
++	e = (int)smc6(SCM_FN(SVC_PIL, PIL_AUTH_RESET), SCM_ARGS(1, SCM_VAL), args, out_r);
 +	if (e) {
 +		printf("SWEET NABU-GPU: zap PAS auth_reset failed (%d)\n", e);
 +		return -9;
