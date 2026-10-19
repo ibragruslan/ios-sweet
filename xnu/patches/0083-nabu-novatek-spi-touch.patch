@@ -23,7 +23,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/nabu_touch.c
-@@ -0,0 +1,1115 @@
+@@ -0,0 +1,1104 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) touch: Novatek NT36523 on GENI SPI SE19.
 + *
@@ -938,17 +938,6 @@
 +	int err = nt_read(NVT_EVENT_BUF, (uint8_t)(NVT_EVENT_BUF & 0x7fu), d, sizeof(d));
 +	if (err) {
 +		return err;
-+	}
-+	bool any = false;
-+	for (unsigned i = 0; i < sizeof(d); ++i) {
-+		if (d[i] != 0) {
-+			any = true;
-+			break;
-+		}
-+	}
-+	if (any) {
-+		printf("SWEET NABU-TOUCH: raw: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-+		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
 +	}
 +	for (unsigned i = 0; i < NT_MAX; ++i) {
 +		const uint8_t *p = d + 6u * i;
