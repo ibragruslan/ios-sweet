@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1201 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -926,12 +926,16 @@ index 0000000..7e770a0
 +
 +	/* Map in GMU SMMU domain */
 +	s_gmu_smmu.base = s_smmu;
-+	smmu_map(&s_gmu_smmu, 0x60000000u, dummy_pa, 4096, SMMU_PRIV | SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x60000000u, dummy_pa, 4096, SMMU_PRIV);
 +	smmu_map(&s_gmu_smmu, 0x04000u, icache_pa, 240 * 1024, SMMU_PRIV | SMMU_EXEC | SMMU_CACHED);
 +	smmu_map(&s_gmu_smmu, 0x44000u, dcache_pa, 512 * 1024, SMMU_PRIV | SMMU_CACHED);
-+	smmu_map(&s_gmu_smmu, 0x60001000u, log_pa, 16384, SMMU_PRIV | SMMU_CACHED);
-+	smmu_map(&s_gmu_smmu, 0x60005000u, hfi_pa, 16384, SMMU_PRIV | SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x60001000u, log_pa, 16384, SMMU_PRIV);
++	smmu_map(&s_gmu_smmu, 0x60005000u, hfi_pa, 16384, SMMU_PRIV);
 +	smmu_attach(&s_gmu_smmu, GMU_SID, GMU_SID_MASK, 1);
++
++	/* Clear GBIF halt and configure bus QoS before GMU boots */
++	wr32(GPU_REG(GBIF_HALT), 0, 0);
++	for (int i = 0; i < 4; ++i) wr32(GPU_REG(GBIF_QSB_SIDE0 + i), 0, 0x00071620u);
 +
 +	/* Setup HFI queues */
 +	hfi_init(hfi_va, 0x60005000u);
@@ -953,6 +957,8 @@ index 0000000..7e770a0
 +		printf("SWEET NABU-GPU: GMU fw parse failed\n");
 +		return -9;
 +	}
++	*(uint32_t *)((uint8_t *)dcache_va + (0x57030u - 0x44000u)) = 0x06040100u;
++	flush_gpu_cache((vm_offset_t)((uint8_t *)dcache_va + (0x57030u - 0x44000u)), 4);
 +
 +	/* 6. Boot GMU CM3 */
 +	wr32(GMU_REG(GMU_CM3_FW_INIT_RESULT), 0, 0);
@@ -968,7 +974,7 @@ index 0000000..7e770a0
 +	wr32(GMU_REG(GMU_ICACHE_CONFIG), 0, 1);
 +	wr32(GMU_REG(GMU_DCACHE_CONFIG), 0, 1);
 +	wr32(GMU_REG(GMU_PWR_COL_INTER_FRAME_CTRL), 0, 0x9c40400u);
-+	wr32(GMU_REG(GMU_RPMH_CTRL), 0, rd32(GMU_REG(GMU_RPMH_CTRL), 0) | 0x1f01u);
++	wr32(GMU_REG(GMU_RPMH_CTRL), 0, rd32(GMU_REG(GMU_RPMH_CTRL), 0) | 0x1f11u);
 +
 +	uint32_t ver = rd32(GMU_REG(GMU_CM3_DTCM_START + 0xff8), 0);
 +	uint32_t mask = ver <= 0x20010004u ? 0xffffffffu : 0x1ffu;
