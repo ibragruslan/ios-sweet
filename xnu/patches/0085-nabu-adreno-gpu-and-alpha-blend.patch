@@ -633,17 +633,20 @@ index 0000000..7e770a0
 +	bzero(hfi_virt, 16384);
 +	QTable *t = (QTable *)hfi_virt;
 +	t->version = 0;
-+	t->size = sizeof(QTable) + 2 * sizeof(QHdr);
++	t->size = sizeof(QTable) + 3 * sizeof(QHdr);
 +	t->qhdr0_offset = sizeof(QTable) >> 2;
 +	t->qhdr_size = sizeof(QHdr) >> 2;
-+	t->num_queues = t->active_queues = 2;
-+	for (int q = 0; q < 2; ++q) {
++	t->num_queues = t->active_queues = 3;
++	for (int q = 0; q < 3; ++q) {
 +		QHdr *h = qhdr(hfi_virt, q);
 +		h->iova = hfi_iova + 4096 * (q + 1);
 +		h->type = (10u << 8) | (uint32_t)q;
 +		h->status = 1;
 +		h->size = Q_DWORDS;
-+		h->rx_watermark = h->tx_watermark = h->rx_request = 1;
++		h->rx_watermark = 1;
++		h->tx_watermark = 1;
++		h->rx_request = 1;
++		h->tx_request = 0;
 +	}
 +	s_hfi_seq = 0;
 +	flush_gpu_cache((vm_offset_t)hfi_virt, 16384);
