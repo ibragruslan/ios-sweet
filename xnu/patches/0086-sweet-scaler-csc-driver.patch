@@ -23,7 +23,7 @@
  iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetScaler.cpp
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,46 @@
 +/*
 + * AppleM2ScalerCSCDriver stub for SWEET.
 + */
@@ -70,4 +70,3 @@
 +}
 +
 +#endif /* SWEET */
-+
