@@ -1348,13 +1348,6 @@ index 0c37b64..2a5e5d1 100644
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
  	return true;
-@@ -318,6 +368,6 @@ void
- AppleCLCD::present(const uint8_t *rec)
- {
- 	uint32_t mask = get32(rec, 0x104);
- 
- 
- 	if (!fConsolePaused) {
 @@ -410,6 +463,19 @@ AppleCLCD::present(const uint8_t *rec)
  			if (pdy < 0) { pdy = 0; }
  			if (pw > (int32_t)fWidth  - pdx) { pw = (int32_t)fWidth  - pdx; }
