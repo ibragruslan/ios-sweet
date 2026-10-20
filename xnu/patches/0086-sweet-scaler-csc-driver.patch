@@ -1,6 +1,6 @@
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -67,6 +67,11 @@
+@@ -67,7 +67,12 @@
      "     'IOProviderClass' = IOPlatformDevice;"
      "     'IONameMatch'     = 'sweet,display';"
      "   },"
@@ -24,7 +24,7 @@
  
  	if (!fConsolePaused) {
  		int quiet = 0;
-@@ -470,4 +473,40 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -470,4 +473,41 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  	}
  	return ret;
  }
