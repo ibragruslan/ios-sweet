@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1191 @@
+@@ -0,0 +1,1195 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -990,8 +990,9 @@ index 0000000..7e770a0
 +		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 1), 0),
 +		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 2), 0),
 +		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 3), 0));
-+		uint32_t *lp = (uint32_t *)log_va;
-+		printf("SWEET NABU-GPU: GMU log: [%#x %#x %#x %#x]\n", lp[0], lp[1], lp[2], lp[3]);
++		printf("SWEET NABU-GPU: GMU log: [%#x %#x %#x %#x]\n",
++		    ((uint32_t *)log_va)[0], ((uint32_t *)log_va)[1],
++		    ((uint32_t *)log_va)[2], ((uint32_t *)log_va)[3]);
 +		return -10;
 +	}
 +
