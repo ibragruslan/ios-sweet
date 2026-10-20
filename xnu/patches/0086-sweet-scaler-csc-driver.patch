@@ -1,0 +1,68 @@
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -67,6 +67,11 @@
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"
+     "   },"
++    "   {"
++    "     'IOClass'         = AppleM2ScalerCSCDriver;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleM2ScalerCSCDriver;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -330,6 +330,9 @@ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	if (mask == 0 && get32(rec, 0x54) != 0) {
++		mask = 1;
++	}
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -470,4 +473,40 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++
++class AppleM2ScalerUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleM2ScalerUserClient);
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE {
++		return true;
++	}
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE {
++		terminate();
++		return kIOReturnSuccess;
++	}
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE {
++		return kIOReturnSuccess;
++	}
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerUserClient, IOUserClient);
++
++bool
++AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleM2ScalerUserClient");
++	registerService();
++	IOLog("SWEET SCALER: AppleM2ScalerCSCDriver registered\n");
++	return true;
++}
+ #endif /* SWEET */
