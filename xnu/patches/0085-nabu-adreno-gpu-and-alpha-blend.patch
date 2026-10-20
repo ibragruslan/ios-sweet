@@ -1061,16 +1061,16 @@ index 0000000..7e770a0
 +		return -14;
 +	}
 +
-+	/* 8. OOB GPU_SET: GMU Powers On GX Domain */
-+	wr32(GMU_REG(GMU_GMU2HOST_INTR_CLR), 0, (1u << 24));
-+	wr32(GMU_REG(GMU_HOST2GMU_INTR_SET), 0, (1u << 16));
++	/* 8. OOB GPU_SET: GMU Powers On GX Domain (A640/A650 v2 uses set_new=30, ack_new=31) */
++	wr32(GMU_REG(GMU_GMU2HOST_INTR_CLR), 0, (1u << 31) | (1u << 24));
++	wr32(GMU_REG(GMU_HOST2GMU_INTR_SET), 0, (1u << 30) | (1u << 16));
 +	int oob = -1;
 +	uint32_t last_info = 0;
 +	for (unsigned int t = 0; t < 5000; ++t) {
 +		last_info = rd32(GMU_REG(GMU_GMU2HOST_INTR_INFO), 0);
-+		if (last_info & (1u << 24)) {
++		if (last_info & ((1u << 31) | (1u << 24))) {
 +			oob = 0;
-+			wr32(GMU_REG(GMU_GMU2HOST_INTR_CLR), 0, (1u << 24));
++			wr32(GMU_REG(GMU_GMU2HOST_INTR_CLR), 0, (1u << 31) | (1u << 24));
 +			break;
 +		}
 +		delay(10);
@@ -1348,13 +1348,10 @@ index 0c37b64..2a5e5d1 100644
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
  	return true;
-@@ -318,6 +368,9 @@ void
+@@ -318,6 +368,6 @@ void
  AppleCLCD::present(const uint8_t *rec)
  {
  	uint32_t mask = get32(rec, 0x104);
-+	if (mask == 0 && get32(rec, 0x54) != 0) {
-+		mask = 1;
-+	}
  
  
  	if (!fConsolePaused) {
