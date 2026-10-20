@@ -1,6 +1,10 @@
 #!/bin/bash
 # Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
 set -euo pipefail
+PAYLOAD=""
+if [ -n "${1:-}" ]; then
+	PAYLOAD="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+fi
 cd "$(dirname "$0")"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
@@ -21,8 +25,9 @@ size=$(aarch64-linux-gnu-nm out/shim.elf | gawk '$3=="_end"{print strtonum("0x"$
 truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
-if [ -n "${1:-}" ]; then
-	cp "$1" out/ramdisk.bin
+if [ -n "$PAYLOAD" ]; then
+	echo "Using payload: $PAYLOAD ($(wc -c < "$PAYLOAD") bytes)"
+	cp "$PAYLOAD" out/ramdisk.bin
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
