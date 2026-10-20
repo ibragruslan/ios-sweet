@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1239 @@
+@@ -0,0 +1,1246 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -738,8 +738,7 @@ index 0000000..7e770a0
 +	uint32_t i;
 +	for (i = 0; i <= ms * 100u; ++i) {
 +		uint32_t hw_rptr = rd32(GPU_REG(CP_RB_RPTR), 0);
-+		uint32_t sh_rptr = s_rptr_shadow ? s_rptr_shadow[0] : ~0u;
-+		if ((hw_rptr == s_wptr || sh_rptr == s_wptr) &&
++		if ((hw_rptr == s_wptr) &&
 +		    !(rd32(GPU_REG(RBBM_STATUS), 0) & ~RBBM_STATUS_CP_AHB_BUSY_CX_MASTER) &&
 +		    !(rd32(GPU_REG(RBBM_INT_0_STATUS), 0) & RBBM_INT_HANG_DETECT)) {
 +			return 0;
@@ -1060,8 +1059,6 @@ index 0000000..7e770a0
 +	}
 +
 +	/* 8. Wake GMU out of BOOT_SLUMBER & request GPU_SET */
-+	wr32(s_gpucc, GPUCC_GX_GDSCR, rd32(s_gpucc, GPUCC_GX_GDSCR) & ~1u);
-+	delay(50);
 +	wr32(GMU_REG(GMU_GMU2HOST_INTR_CLR), 0, (1u << 30) | (1u << 24) | (1u << 31));
 +	wr32(GMU_REG(GMU_HOST2GMU_INTR_SET), 0, (1u << 16) | (1u << 30));
 +	int oob = -1;
@@ -1106,10 +1103,9 @@ index 0000000..7e770a0
 +	flush_gpu_cache((vm_offset_t)sqe_va, sqe_len - 4);
 +
 +	s_gpu_smmu.base = s_smmu;
-+	smmu_map(&s_gpu_smmu, sqe_pa, sqe_pa, 64 * 1024, SMMU_PRIV | SMMU_EXEC | SMMU_CACHED);
++	smmu_map(&s_gpu_smmu, sqe_pa, sqe_pa, 64 * 1024, SMMU_EXEC | SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, s_rb_pa, s_rb_pa, RB_BYTES, SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, s_scratch_pa, s_scratch_pa, 4096, SMMU_CACHED);
-+	smmu_map(&s_gpu_smmu, rptr_sh_pa, rptr_sh_pa, 4096, SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, 0x9c000000ULL, 0x9c000000ULL, 16 * 1024 * 1024, SMMU_CACHED);
 +	smmu_attach(&s_gpu_smmu, GPU_SID, GPU_SID_MASK, 0);
 +
@@ -1159,7 +1155,38 @@ index 0000000..7e770a0
 +	wr32(GPU_REG(CP_PROTECT(31)), 0, g_protect[n_prot - 1]);
 +	wr32(GPU_REG(RBBM_INT_0_MASK), 0, 0);
 +
-+	/* 11. Authenticate Zap Shader via TrustZone SCM */
++	/* 11. Start CP (A640: no hw_apriv, no RPTR shadow) */
++	wr32(GPU_REG(CP_SQE_INSTR_BASE),     0, (uint32_t)sqe_pa);
++	wr32(GPU_REG(CP_SQE_INSTR_BASE + 1), 0, (uint32_t)(sqe_pa >> 32));
++	wr32(GPU_REG(CP_RB_BASE),            0, (uint32_t)s_rb_pa);
++	wr32(GPU_REG(CP_RB_BASE + 1),        0, (uint32_t)(s_rb_pa >> 32));
++	wr32(GPU_REG(CP_RB_CNTL),            0, RB_CNTL_VALUE | (1u << 27)); /* NO_UPDATE */
++	s_wptr = 0;
++	wr32(GPU_REG(CP_SQE_CNTL), 0, 1);
++
++	/* Sanity check: is GX domain alive and registers readable? */
++	printf("SWEET NABU-GPU: RB_BASE rb=%#x SQE_CNTL rb=%#x\n",
++	    rd32(GPU_REG(CP_RB_BASE), 0), rd32(GPU_REG(CP_SQE_CNTL), 0));
++
++	/* 12. ME_INIT FIRST (as required by SQE microcode on A6xx) */
++	out_pkt7(CP_ME_INIT, 8);
++	out_ring(0x0000002fu);
++	out_ring(0x00000003u);
++	out_ring(0x20000000u);
++	out_ring(0); out_ring(0); out_ring(0); out_ring(0); out_ring(0);
++	rb_flush();
++	if (rb_idle(500)) {
++		printf("SWEET NABU-GPU: CP ME_INIT timeout (hw_rptr=%u wptr=%u status=%#x fault=%#x intr=%#x rbbm_int=%#x fsr=%#x far=%#x)\n",
++		    rd32(GPU_REG(CP_RB_RPTR), 0), s_wptr, rd32(GPU_REG(RBBM_STATUS), 0),
++		    rd32(GPU_REG(CP_HW_FAULT), 0), rd32(GPU_REG(CP_INTERRUPT_STATUS), 0),
++		    rd32(GPU_REG(RBBM_INT_0_STATUS), 0),
++		    s_gpu_smmu.cb ? rd32(s_gpu_smmu.cb + 0x58, 0) : 0,
++		    s_gpu_smmu.cb ? rd32(s_gpu_smmu.cb + 0x60, 0) : 0);
++		return -21;
++	}
++	printf("SWEET NABU-GPU: CP ME_INIT success!\n");
++
++	/* 13. Authenticate Zap Shader via TrustZone SCM */
 +	bcopy(zap_mdt, zap_va, mdt_len);
 +	flush_gpu_cache((vm_offset_t)zap_va, (mdt_len + 4095) & ~4095ULL);
 +	args[0] = PAS_ID_GPU;
@@ -1193,44 +1220,20 @@ index 0000000..7e770a0
 +	}
 +	printf("SWEET NABU-GPU: zap shader authenticated via TrustZone SCM!\n");
 +
-+	/* 12. Start CP & Ringbuffer */
-+	wr32(GPU_REG(CP_SQE_INSTR_BASE), 0, (uint32_t)sqe_pa);
-+	wr32(GPU_REG(CP_SQE_INSTR_BASE + 1), 0, (uint32_t)(sqe_pa >> 32));
-+	wr32(GPU_REG(CP_RB_BASE), 0, (uint32_t)s_rb_pa);
-+	wr32(GPU_REG(CP_RB_BASE + 1), 0, (uint32_t)(s_rb_pa >> 32));
-+	wr32(GPU_REG(CP_RB_RPTR_ADDR), 0, (uint32_t)rptr_sh_pa);
-+	wr32(GPU_REG(CP_RB_RPTR_ADDR + 1), 0, (uint32_t)(rptr_sh_pa >> 32));
-+	wr32(GPU_REG(CP_RB_CNTL), 0, RB_CNTL_VALUE);
-+	wr32(GPU_REG(CP_APRIV_CNTL), 0, 0x6e);
-+	wr32(GPU_REG(CP_RB_RPTR), 0, 0);
-+	wr32(GPU_REG(CP_RB_WPTR), 0, 0);
-+	s_wptr = 0;
-+	s_rptr_shadow[0] = 0;
-+	wr32(GPU_REG(CP_SQE_CNTL), 0, 1);
-+
-+	/* 13. Disable Secure Mode via CP */
++	/* 14. Disable Secure Mode via CP */
 +	out_pkt7(CP_SET_SECURE_MODE, 1);
 +	out_ring(0);
 +	rb_flush();
 +	if (rb_idle(500)) {
-+		printf("SWEET NABU-GPU: CP SET_SECURE_MODE timeout (hw_rptr=%u sh_rptr=%u wptr=%u status=%#x)\n",
-+		    rd32(GPU_REG(CP_RB_RPTR), 0), s_rptr_shadow[0], s_wptr, rd32(GPU_REG(RBBM_STATUS), 0));
++		printf("SWEET NABU-GPU: CP SET_SECURE_MODE timeout (hw_rptr=%u wptr=%u status=%#x fault=%#x intr=%#x rbbm_int=%#x fsr=%#x far=%#x)\n",
++		    rd32(GPU_REG(CP_RB_RPTR), 0), s_wptr, rd32(GPU_REG(RBBM_STATUS), 0),
++		    rd32(GPU_REG(CP_HW_FAULT), 0), rd32(GPU_REG(CP_INTERRUPT_STATUS), 0),
++		    rd32(GPU_REG(RBBM_INT_0_STATUS), 0),
++		    s_gpu_smmu.cb ? rd32(s_gpu_smmu.cb + 0x58, 0) : 0,
++		    s_gpu_smmu.cb ? rd32(s_gpu_smmu.cb + 0x60, 0) : 0);
 +		return -20;
 +	}
-+
-+	/* 14. MicroEngine Init */
-+	out_pkt7(CP_ME_INIT, 8);
-+	out_ring(0x0000002fu);
-+	out_ring(0x00000003u);
-+	out_ring(0x20000000u);
-+	out_ring(0); out_ring(0); out_ring(0); out_ring(0); out_ring(0);
-+	rb_flush();
-+	if (rb_idle(500)) {
-+		printf("SWEET NABU-GPU: CP ME_INIT timeout (hw_rptr=%u sh_rptr=%u wptr=%u status=%#x)\n",
-+		    rd32(GPU_REG(CP_RB_RPTR), 0), s_rptr_shadow[0], s_wptr, rd32(GPU_REG(RBBM_STATUS), 0));
-+		return -21;
-+	}
-+	printf("SWEET NABU-GPU: CP ME_INIT success!\n");
++	printf("SWEET NABU-GPU: CP SET_SECURE_MODE success!\n");
 +
 +	/* 15. Verify CP Memory Write */
 +	out_pkt7(CP_MEM_WRITE, 4);
@@ -1240,8 +1243,12 @@ index 0000000..7e770a0
 +	out_ring(0x0DEC0DE5u);
 +	rb_flush();
 +	if (rb_idle(500)) {
-+		printf("SWEET NABU-GPU: CP MEM_WRITE timeout (hw_rptr=%u sh_rptr=%u wptr=%u status=%#x)\n",
-+		    rd32(GPU_REG(CP_RB_RPTR), 0), s_rptr_shadow[0], s_wptr, rd32(GPU_REG(RBBM_STATUS), 0));
++		printf("SWEET NABU-GPU: CP MEM_WRITE timeout (hw_rptr=%u wptr=%u status=%#x fault=%#x intr=%#x rbbm_int=%#x fsr=%#x far=%#x)\n",
++		    rd32(GPU_REG(CP_RB_RPTR), 0), s_wptr, rd32(GPU_REG(RBBM_STATUS), 0),
++		    rd32(GPU_REG(CP_HW_FAULT), 0), rd32(GPU_REG(CP_INTERRUPT_STATUS), 0),
++		    rd32(GPU_REG(RBBM_INT_0_STATUS), 0),
++		    s_gpu_smmu.cb ? rd32(s_gpu_smmu.cb + 0x58, 0) : 0,
++		    s_gpu_smmu.cb ? rd32(s_gpu_smmu.cb + 0x60, 0) : 0);
 +		return -22;
 +	}
 +	flush_gpu_cache((vm_offset_t)s_scratch, 64);
