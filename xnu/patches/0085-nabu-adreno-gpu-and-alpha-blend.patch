@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1169 @@
+@@ -0,0 +1,1191 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -284,6 +284,14 @@ index 0000000..7e770a0
 +	__asm__ volatile("dsb osh" ::: "memory");
 +}
 +
++static inline void
++wr64(vm_offset_t base, uint32_t off, uint64_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint64_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
 +#define GMU_REG(dw) (s_gmu + ((uint64_t)(dw) << 2))
 +#define RSCC_REG(dw) (s_gmu + 0x23000ULL + ((uint64_t)(dw) << 2))
 +#define PDC_REG(dw) (s_pdc + ((uint64_t)(dw) << 2))
@@ -468,14 +476,16 @@ index 0000000..7e770a0
 +
 +	/* Disable & config CB */
 +	wr32(d->cb, 0x000u, 0); /* CB_SCTLR = 0 */
-+	wr32(d->cb, 0x004u, rd32(d->cb, 0x004u) & ~2u); /* ACTLR */
++	wr32(d->cb, 0x004u, 0x303u); /* ACTLR: PREFETCH_DEEP | CPRE | CMTLB */
 +	wr32(d->cb, 0x010u, 2u | (1u << 4) | (7u << 15)); /* TCR2: 40-bit PA, 16-bit ASID, SEP=upstream */
 +	wr32(d->cb, 0x030u, 25u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23)); /* TCR: 39-bit IOVA */
 +	uint64_t rpa = s_dma_pa + ((uint64_t)(uintptr_t)d->root - s_dma_va);
 +	uint64_t ttbr = rpa | ((uint64_t)target_cb << 48);
-+	wr32(d->cb, 0x020u, (uint32_t)ttbr);
-+	wr32(d->cb, 0x024u, (uint32_t)(ttbr >> 32));
++	wr64(d->cb, 0x020u, ttbr);
++	wr64(d->cb, 0x028u, (uint64_t)target_cb << 48);
++	wr32(d->cb, 0x034u, (uint32_t)target_cb);
 +	wr32(d->cb, 0x038u, 0x0004FF44u); /* MAIR0 */
++	wr32(d->cb, 0x03Cu, 0);            /* MAIR1 */
 +	wr32(d->cb, 0x058u, 0xffffffffu); /* clear FSR */
 +	wr32(d->cb, 0x618u, 0);            /* TLBIALL */
 +	wr32(d->cb, 0x7f0u, 0);            /* TLBSYNC */
@@ -955,7 +965,7 @@ index 0000000..7e770a0
 +	wr32(GMU_REG(GMU_ICACHE_CONFIG), 0, 1);
 +	wr32(GMU_REG(GMU_DCACHE_CONFIG), 0, 1);
 +	wr32(GMU_REG(GMU_PWR_COL_INTER_FRAME_CTRL), 0, 0x9c40400u);
-+	wr32(GMU_REG(GMU_RPMH_CTRL), 0, rd32(GMU_REG(GMU_RPMH_CTRL), 0) | 0xf01u);
++	wr32(GMU_REG(GMU_RPMH_CTRL), 0, rd32(GMU_REG(GMU_RPMH_CTRL), 0) | 0x1f01u);
 +
 +	uint32_t ver = rd32(GMU_REG(GMU_CM3_DTCM_START + 0xff8), 0);
 +	uint32_t mask = ver <= 0x20010004u ? 0xffffffffu : 0x1ffu;
@@ -963,10 +973,22 @@ index 0000000..7e770a0
 +	wr32(GMU_REG(GMU_CM3_SYSRESET), 0, 1);
 +	wr32(GMU_REG(GMU_PWR_COL_CP_RESP), 0, 0);
 +	wr32(GMU_REG(GMU_CM3_SYSRESET), 0, 0);
-+	if (poll_bit(GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, ok_val, 200)) {
-+		printf("SWEET NABU-GPU: GMU init timeout (ver=%#x res=%#x fsr=%#x far=%#x)\n",
++	if (poll_bit(GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, ok_val, 1000)) {
++		printf("SWEET NABU-GPU: GMU init timeout (ver=%#x res=%#x fsr=%#x far=%#x intr=%#x ao_intr=%#x pwr=%#x)\n",
 +		    ver, rd32(GMU_REG(GMU_CM3_FW_INIT_RESULT), 0),
-+		    rd32(s_gmu_smmu.cb, 0x058), rd32(s_gmu_smmu.cb, 0x060));
++		    rd32(s_gmu_smmu.cb, 0x058), rd32(s_gmu_smmu.cb, 0x060),
++		    rd32(GMU_REG(GMU_GMU2HOST_INTR_INFO), 0),
++		    rd32(GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS), 0),
++		    rd32(GMU_REG(GMU_SPTPRAC_PWR_CLK_STATUS), 0));
++		printf("SWEET NABU-GPU: GMU crashdump pc=%#x lr=%#x r0=%#x r1=%#x r2=%#x r3=%#x\n",
++		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 6), 0),
++		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 5), 0),
++		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 0), 0),
++		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 1), 0),
++		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 2), 0),
++		    rd32(GMU_REG(GMU_CM3_DTCM_START + 0x49Du + 3), 0));
++		uint32_t *lp = (uint32_t *)log_va;
++		printf("SWEET NABU-GPU: GMU log: [%#x %#x %#x %#x]\n", lp[0], lp[1], lp[2], lp[3]);
 +		return -10;
 +	}
 +
