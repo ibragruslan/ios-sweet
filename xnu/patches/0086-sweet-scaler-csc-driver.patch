@@ -1,8 +1,8 @@
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -67,7 +67,12 @@
-     "     'IOProviderClass' = IOPlatformDevice;"
-     "     'IONameMatch'     = 'sweet,display';"
+@@ -82,7 +82,12 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
      "   },"
 +    "   {"
 +    "     'IOClass'         = AppleM2ScalerCSCDriver;"
@@ -12,22 +12,25 @@
  #endif
      "   {"
      "     'IOClass'         = IOPanicPlatform;"
---- a/iokit/Kernel/arm/SweetFramebuffer.cpp
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -330,6 +330,9 @@ void
- AppleCLCD::swap(const uint8_t *rec)
- {
- 	uint32_t mask = get32(rec, 0x104);
-+	if (mask == 0 && get32(rec, 0x54) != 0) {
-+		mask = 1;
-+	}
- 
- 	if (!fConsolePaused) {
- 		int quiet = 0;
-@@ -470,4 +473,41 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
- 	}
- 	return ret;
- }
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetScaler.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetScaler.cpp
+@@ -0,0 +1,47 @@
++/*
++ * AppleM2ScalerCSCDriver stub for SWEET.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++
++#if defined(SWEET)
 +
 +class AppleM2ScalerCSCDriver : public IOService {
 +	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
@@ -65,4 +68,6 @@
 +	IOLog("SWEET SCALER: AppleM2ScalerCSCDriver registered\n");
 +	return true;
 +}
- #endif /* SWEET */
++
++#endif /* SWEET */
++
