@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1246 @@
+@@ -0,0 +1,1251 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -83,6 +83,7 @@ index 0000000..7e770a0
 +
 +/* GPUCC Registers */
 +#define GPUCC_GX_GDSCR           0x100C
++#define GPUCC_GX_GFX3D_CBCR      0x1054
 +#define GPUCC_CX_GDSCR           0x106C
 +#define GPUCC_AHB_CBCR           0x1078
 +#define GPUCC_CX_GMU_CBCR        0x1098
@@ -102,6 +103,8 @@ index 0000000..7e770a0
 +#define GMU_CM3_FW_INIT_RESULT   0x501C
 +#define GMU_CM3_CFG              0x502D
 +#define GMU_PWR_COL_INTER_FRAME_CTRL 0x50C0
++#define GMU_GX_SPTPRAC_POWER_CONTROL 0x0081
++#define GMU_BOOT_SLUMBER_OPTION      0x23F8
 +#define GMU_SPTPRAC_PWR_CLK_STATUS 0x50D0
 +#define GMU_RPMH_CTRL            0x50E8
 +#define GMU_PWR_COL_CP_MSG       0x5100
@@ -1058,7 +1061,14 @@ index 0000000..7e770a0
 +		return -14;
 +	}
 +
-+	/* 8. Wake GMU out of BOOT_SLUMBER & request GPU_SET */
++	/* 8. Wake GMU out of BOOT_SLUMBER, enable SPTPRAC & request GPU_SET */
++	wr32(GMU_REG(GMU_BOOT_SLUMBER_OPTION), 0, 0); /* 0 = boot */
++	wr32(s_gpucc, GPUCC_GX_GDSCR, rd32(s_gpucc, GPUCC_GX_GDSCR) & ~1u); /* deassert SW_COLLAPSE */
++	wr32(s_gpucc, GPUCC_GX_GFX3D_CBCR, rd32(s_gpucc, GPUCC_GX_GFX3D_CBCR) | 1u); /* enable GFX3D clock branch */
++	delay(10);
++	wr32(GMU_REG(GMU_GX_SPTPRAC_POWER_CONTROL), 0, 0x778000u); /* enable SPTPRAC power rail/clock */
++	int sptprac_err = poll_bit(GMU_REG(GMU_SPTPRAC_PWR_CLK_STATUS), 0x38, 0x28, 500);
++
 +	wr32(GMU_REG(GMU_GMU2HOST_INTR_CLR), 0, (1u << 30) | (1u << 24) | (1u << 31));
 +	wr32(GMU_REG(GMU_HOST2GMU_INTR_SET), 0, (1u << 16) | (1u << 30));
 +	int oob = -1;
@@ -1075,15 +1085,10 @@ index 0000000..7e770a0
 +	int pwr_err = poll_bit(GMU_REG(GMU_SPTPRAC_PWR_CLK_STATUS), GX_HM_GDSC_POWER_OFF | GX_HM_CLK_OFF, 0, 500);
 +	uint32_t pwr = rd32(GMU_REG(GMU_SPTPRAC_PWR_CLK_STATUS), 0);
 +	uint32_t rbbm = rd32(GPU_REG(RBBM_STATUS), 0);
-+	if (oob || pwr_err || (pwr & (GX_HM_GDSC_POWER_OFF | GX_HM_CLK_OFF))) {
-+		printf("SWEET NABU-GPU: GX power bringup note (oob=%d pwr_err=%d pwr=%#x info=%#x RBBM=%#x)\n",
-+		    oob, pwr_err, pwr, last_info, rbbm);
-+		if (rbbm == 0xffffffffu) {
-+			return -15;
-+		}
-+		printf("SWEET NABU-GPU: GPU core is alive (RBBM=%#x), continuing bringup!\n", rbbm);
-+	} else {
-+		printf("SWEET NABU-GPU: GX domain powered on (pwr=%#x, RBBM=%#x)\n", pwr, rbbm);
++	printf("SWEET NABU-GPU: GX bringup (sptprac_err=%d oob=%d pwr_err=%d pwr=%#x info=%#x RBBM=%#x)\n",
++	    sptprac_err, oob, pwr_err, pwr, last_info, rbbm);
++	if (rbbm == 0xffffffffu) {
++		return -15;
 +	}
 +
 +	/* 9. Suballocate GPU Core Buffers & SMMU */
