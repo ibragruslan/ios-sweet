@@ -598,7 +598,7 @@ index 0000000..7e770a0
 +			}
 +		} else {
 +			(void)(bo_put(icache, 0x04000u, 240 * 1024, b->addr, data, b->size) ||
-+			       bo_put(dcache, 0x44000u, 240 * 1024, b->addr, data, b->size) ||
++			       bo_put(dcache, 0x44000u, 512 * 1024, b->addr, data, b->size) ||
 +			       bo_put(dummy,  0x60000000u, 4096,   b->addr, data, b->size));
 +		}
 +	}
@@ -916,7 +916,7 @@ index 0000000..7e770a0
 +	uint64_t dummy_pa, icache_pa, dcache_pa, log_pa, hfi_pa;
 +	void *dummy_va  = dma_alloc_bytes(4096, &dummy_pa);
 +	void *icache_va = dma_alloc_bytes(240 * 1024, &icache_pa);
-+	void *dcache_va = dma_alloc_bytes(240 * 1024, &dcache_pa);
++	void *dcache_va = dma_alloc_bytes(512 * 1024, &dcache_pa);
 +	void *log_va    = dma_alloc_bytes(16384, &log_pa);
 +	void *hfi_va    = dma_alloc_bytes(16384, &hfi_pa);
 +	if (!dummy_va || !icache_va || !dcache_va || !log_va || !hfi_va) {
@@ -928,7 +928,7 @@ index 0000000..7e770a0
 +	s_gmu_smmu.base = s_smmu;
 +	smmu_map(&s_gmu_smmu, 0x60000000u, dummy_pa, 4096, SMMU_PRIV | SMMU_CACHED);
 +	smmu_map(&s_gmu_smmu, 0x04000u, icache_pa, 240 * 1024, SMMU_PRIV | SMMU_EXEC | SMMU_CACHED);
-+	smmu_map(&s_gmu_smmu, 0x44000u, dcache_pa, 240 * 1024, SMMU_PRIV | SMMU_CACHED);
++	smmu_map(&s_gmu_smmu, 0x44000u, dcache_pa, 512 * 1024, SMMU_PRIV | SMMU_CACHED);
 +	smmu_map(&s_gmu_smmu, 0x60001000u, log_pa, 16384, SMMU_PRIV | SMMU_CACHED);
 +	smmu_map(&s_gmu_smmu, 0x60005000u, hfi_pa, 16384, SMMU_PRIV | SMMU_CACHED);
 +	smmu_attach(&s_gmu_smmu, GMU_SID, GMU_SID_MASK, 1);
