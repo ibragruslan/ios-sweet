@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7e770a0
 --- /dev/null
 +++ b/bsd/dev/nabu_adreno.c
-@@ -0,0 +1,1201 @@
+@@ -0,0 +1,1216 @@
 +/*
 + * NABU (Xiaomi Pad 5, SM8150) Adreno 640 GPU Driver for XNU.
 + *
@@ -163,6 +163,7 @@ index 0000000..7e770a0
 +#define RBBM_PERFCTR_GPU_BUSY_MASKED 0x0050B
 +#define CP_RB_BASE                 0x0800
 +#define CP_RB_CNTL                 0x0802
++#define CP_RB_RPTR_ADDR            0x0804
 +#define CP_RB_RPTR                 0x0806
 +#define CP_RB_WPTR                 0x0807
 +#define CP_SQE_CNTL                0x0808
@@ -170,6 +171,7 @@ index 0000000..7e770a0
 +#define CP_INTERRUPT_STATUS        0x0823
 +#define CP_SQE_INSTR_BASE          0x0830
 +#define CP_ADDR_MODE_CNTL          0x0842
++#define CP_APRIV_CNTL              0x0844
 +#define CP_PROTECT_CNTL            0x084F
 +#define CP_PROTECT(i)              (0x0850 + (i))
 +#define CP_ROQ_THRESHOLDS_1        0x08C1
@@ -242,7 +244,7 @@ index 0000000..7e770a0
 +
 +#define RB_BYTES                   (32 * 1024)
 +#define RB_DWORDS                  (RB_BYTES / 4)
-+#define RB_CNTL_VALUE              (12U | (2U << 8) | (1U << 27))
++#define RB_CNTL_VALUE              (12U | (2U << 8))
 +
 +#define PROT_RO(r, l) ((((uint32_t)(l) & 0x3FFF) << 18) | ((uint32_t)(r) & 0x3FFFF))
 +#define PROT_NO(r, l) ((1U << 31) | PROT_RO(r, l))
@@ -695,6 +697,7 @@ index 0000000..7e770a0
 +static uint32_t s_wptr = 0;
 +static uint32_t *s_scratch;
 +static uint64_t s_scratch_pa;
++static uint32_t *s_rptr_shadow = NULL;
 +static uint32_t s_seq = 0;
 +
 +static inline uint32_t
@@ -734,7 +737,9 @@ index 0000000..7e770a0
 +{
 +	uint32_t i;
 +	for (i = 0; i <= ms * 100u; ++i) {
-+		if (rd32(GPU_REG(CP_RB_RPTR), 0) == s_wptr &&
++		uint32_t hw_rptr = rd32(GPU_REG(CP_RB_RPTR), 0);
++		uint32_t sh_rptr = s_rptr_shadow ? s_rptr_shadow[0] : ~0u;
++		if ((hw_rptr == s_wptr || sh_rptr == s_wptr) &&
 +		    !(rd32(GPU_REG(RBBM_STATUS), 0) & ~RBBM_STATUS_CP_AHB_BUSY_CX_MASTER) &&
 +		    !(rd32(GPU_REG(RBBM_INT_0_STATUS), 0) & RBBM_INT_HANG_DETECT)) {
 +			return 0;
@@ -1066,12 +1071,13 @@ index 0000000..7e770a0
 +	printf("SWEET NABU-GPU: GX domain powered on (pwr=%#x, RBBM=%#x)\n", pwr, rd32(GPU_REG(RBBM_STATUS), 0));
 +
 +	/* 9. Suballocate GPU Core Buffers & SMMU */
-+	uint64_t sqe_pa, zap_meta_pa;
++	uint64_t sqe_pa, zap_meta_pa, rptr_sh_pa;
 +	void *sqe_va = dma_alloc_bytes(64 * 1024, &sqe_pa);
 +	s_rb         = (uint32_t *)dma_alloc_bytes(RB_BYTES, &s_rb_pa);
 +	s_scratch    = (uint32_t *)dma_alloc_bytes(4096, &s_scratch_pa);
++	s_rptr_shadow = (uint32_t *)dma_alloc_bytes(4096, &rptr_sh_pa);
 +	void *zap_va = dma_alloc_bytes(16384, &zap_meta_pa);
-+	if (!sqe_va || !s_rb || !s_scratch || !zap_va) {
++	if (!sqe_va || !s_rb || !s_scratch || !s_rptr_shadow || !zap_va) {
 +		printf("SWEET NABU-GPU: GPU buffer alloc failed\n");
 +		return -16;
 +	}
@@ -1084,6 +1090,7 @@ index 0000000..7e770a0
 +	smmu_map(&s_gpu_smmu, sqe_pa, sqe_pa, 64 * 1024, SMMU_PRIV | SMMU_EXEC | SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, s_rb_pa, s_rb_pa, RB_BYTES, SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, s_scratch_pa, s_scratch_pa, 4096, SMMU_CACHED);
++	smmu_map(&s_gpu_smmu, rptr_sh_pa, rptr_sh_pa, 4096, SMMU_CACHED);
 +	smmu_map(&s_gpu_smmu, 0x9c000000ULL, 0x9c000000ULL, 16 * 1024 * 1024, SMMU_CACHED);
 +	smmu_attach(&s_gpu_smmu, GPU_SID, GPU_SID_MASK, 0);
 +
@@ -1133,38 +1140,14 @@ index 0000000..7e770a0
 +	wr32(GPU_REG(CP_PROTECT(31)), 0, g_protect[n_prot - 1]);
 +	wr32(GPU_REG(RBBM_INT_0_MASK), 0, 0);
 +
-+	/* 11. Start CP & Send ME_INIT */
-+	wr32(GPU_REG(CP_SQE_INSTR_BASE), 0, (uint32_t)sqe_pa);
-+	wr32(GPU_REG(CP_SQE_INSTR_BASE + 1), 0, (uint32_t)(sqe_pa >> 32));
-+	wr32(GPU_REG(CP_RB_BASE), 0, (uint32_t)s_rb_pa);
-+	wr32(GPU_REG(CP_RB_BASE + 1), 0, (uint32_t)(s_rb_pa >> 32));
-+	wr32(GPU_REG(CP_RB_CNTL), 0, RB_CNTL_VALUE);
-+	wr32(GPU_REG(CP_RB_RPTR), 0, 0);
-+	wr32(GPU_REG(CP_RB_WPTR), 0, 0);
-+	s_wptr = 0;
-+	wr32(GPU_REG(CP_SQE_CNTL), 0, 1);
-+
-+	out_pkt7(CP_ME_INIT, 8);
-+	out_ring(0x0000002fu);
-+	out_ring(0x00000003u);
-+	out_ring(0x20000000u);
-+	out_ring(0); out_ring(0); out_ring(0); out_ring(0); out_ring(0);
-+	rb_flush();
-+	if (rb_idle(200)) {
-+		printf("SWEET NABU-GPU: CP ME_INIT timeout (status=%#x)\n", rd32(GPU_REG(RBBM_STATUS), 0));
-+		return -17;
-+	}
-+	printf("SWEET NABU-GPU: CP ME_INIT success!\n");
-+
-+	/* 12. Authenticate Zap Shader via TrustZone SCM */
++	/* 11. Authenticate Zap Shader via TrustZone SCM */
 +	bcopy(zap_mdt, zap_va, mdt_len);
 +	flush_gpu_cache((vm_offset_t)zap_va, (mdt_len + 4095) & ~4095ULL);
-+	args[0] = PAS_ID_GPU;
-+	args[1] = zap_meta_pa;
-+	e = (int)smc6(SCM_FN(SVC_PIL, PIL_INIT_IMAGE), SCM_ARGS(2, SCM_VAL, SCM_RW), args, out_r);
++	uint64_t args[4] = { PAS_ID_GPU, zap_meta_pa, 0, 0 }, out_r[3] = {0};
++	int e = (int)smc6(SCM_FN(SVC_PIL, PIL_INIT_IMAGE), SCM_ARGS(2, SCM_VAL, SCM_RW), args, out_r);
 +	if (e) {
 +		printf("SWEET NABU-GPU: zap PAS init_image failed (%d)\n", e);
-+		return -18;
++		return -17;
 +	}
 +	args[0] = PAS_ID_GPU;
 +	args[1] = ZAP_REGION_PA;
@@ -1172,7 +1155,7 @@ index 0000000..7e770a0
 +	e = (int)smc6(SCM_FN(SVC_PIL, PIL_MEM_SETUP), SCM_ARGS(3, SCM_VAL, SCM_VAL, SCM_VAL), args, out_r);
 +	if (e) {
 +		printf("SWEET NABU-GPU: zap PAS mem_setup failed (%d)\n", e);
-+		return -19;
++		return -18;
 +	}
 +	vm_offset_t zap_target_va = ml_io_map(ZAP_REGION_PA, ZAP_REGION_SZ);
 +	if (zap_target_va) {
@@ -1183,27 +1166,59 @@ index 0000000..7e770a0
 +	e = (int)smc6(SCM_FN(SVC_PIL, PIL_AUTH_RESET), SCM_ARGS(1, SCM_VAL), args, out_r);
 +	if (e) {
 +		printf("SWEET NABU-GPU: zap PAS auth_reset failed (%d)\n", e);
-+		return -20;
++		return -19;
 +	}
++	printf("SWEET NABU-GPU: zap shader authenticated via TrustZone SCM!\n");
 +
-+	/* 13. Disable Secure Mode */
++	/* 12. Start CP & Ringbuffer */
++	wr32(GPU_REG(CP_SQE_INSTR_BASE), 0, (uint32_t)sqe_pa);
++	wr32(GPU_REG(CP_SQE_INSTR_BASE + 1), 0, (uint32_t)(sqe_pa >> 32));
++	wr32(GPU_REG(CP_RB_BASE), 0, (uint32_t)s_rb_pa);
++	wr32(GPU_REG(CP_RB_BASE + 1), 0, (uint32_t)(s_rb_pa >> 32));
++	wr32(GPU_REG(CP_RB_RPTR_ADDR), 0, (uint32_t)rptr_sh_pa);
++	wr32(GPU_REG(CP_RB_RPTR_ADDR + 1), 0, (uint32_t)(rptr_sh_pa >> 32));
++	wr32(GPU_REG(CP_RB_CNTL), 0, RB_CNTL_VALUE);
++	wr32(GPU_REG(CP_APRIV_CNTL), 0, 0x6e);
++	wr32(GPU_REG(CP_RB_RPTR), 0, 0);
++	wr32(GPU_REG(CP_RB_WPTR), 0, 0);
++	s_wptr = 0;
++	s_rptr_shadow[0] = 0;
++	wr32(GPU_REG(CP_SQE_CNTL), 0, 1);
++
++	/* 13. Disable Secure Mode via CP */
 +	out_pkt7(CP_SET_SECURE_MODE, 1);
 +	out_ring(0);
 +	rb_flush();
-+	if (rb_idle(200)) {
-+		printf("SWEET NABU-GPU: SET_SECURE_MODE timeout\n");
-+		return -21;
++	if (rb_idle(500)) {
++		printf("SWEET NABU-GPU: CP SET_SECURE_MODE timeout (hw_rptr=%u sh_rptr=%u wptr=%u status=%#x)\n",
++		    rd32(GPU_REG(CP_RB_RPTR), 0), s_rptr_shadow[0], s_wptr, rd32(GPU_REG(RBBM_STATUS), 0));
++		return -20;
 +	}
 +
-+	/* 14. Verify CP Memory Write */
++	/* 14. MicroEngine Init */
++	out_pkt7(CP_ME_INIT, 8);
++	out_ring(0x0000002fu);
++	out_ring(0x00000003u);
++	out_ring(0x20000000u);
++	out_ring(0); out_ring(0); out_ring(0); out_ring(0); out_ring(0);
++	rb_flush();
++	if (rb_idle(500)) {
++		printf("SWEET NABU-GPU: CP ME_INIT timeout (hw_rptr=%u sh_rptr=%u wptr=%u status=%#x)\n",
++		    rd32(GPU_REG(CP_RB_RPTR), 0), s_rptr_shadow[0], s_wptr, rd32(GPU_REG(RBBM_STATUS), 0));
++		return -21;
++	}
++	printf("SWEET NABU-GPU: CP ME_INIT success!\n");
++
++	/* 15. Verify CP Memory Write */
 +	out_pkt7(CP_MEM_WRITE, 4);
 +	out_ring((uint32_t)s_scratch_pa);
 +	out_ring((uint32_t)(s_scratch_pa >> 32));
 +	out_ring(0xC0FFEE01u);
 +	out_ring(0x0DEC0DE5u);
 +	rb_flush();
-+	if (rb_idle(200)) {
-+		printf("SWEET NABU-GPU: CP MEM_WRITE timeout\n");
++	if (rb_idle(500)) {
++		printf("SWEET NABU-GPU: CP MEM_WRITE timeout (hw_rptr=%u sh_rptr=%u wptr=%u status=%#x)\n",
++		    rd32(GPU_REG(CP_RB_RPTR), 0), s_rptr_shadow[0], s_wptr, rd32(GPU_REG(RBBM_STATUS), 0));
 +		return -22;
 +	}
 +	flush_gpu_cache((vm_offset_t)s_scratch, 64);
