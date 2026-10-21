@@ -1,0 +1,61 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,44 @@
+ 
+ extern "C" int nabu_backlight_set_power(int on);
+ 
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++
++class AppleM2ScalerUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleM2ScalerUserClient);
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE {
++		return true;
++	}
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE {
++		terminate();
++		return kIOReturnSuccess;
++	}
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE {
++		return kIOReturnSuccess;
++	}
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerUserClient, IOUserClient);
++
++bool
++AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleM2ScalerUserClient");
++	registerService();
++	IOLog("SWEET SCALER: AppleM2ScalerCSCDriver registered\n");
++	return true;
++}
++
++
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+@@ -207,6 +245,13 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	AppleM2ScalerCSCDriver *scaler = new AppleM2ScalerCSCDriver;
++	if (scaler) {
++		if (scaler->init()) {
++			scaler->attach(this);
++			scaler->start(this);
++		}
++	}
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
